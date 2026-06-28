@@ -17,8 +17,6 @@ into a single combined zip for easy sharing.
 > Credentials you enter are used solely to authenticate to your SD-WAN Manager
 > for the session and are never stored.
 
-> **Note:** SSL certificate verification is intentionally disabled. This tool is
-> intended for use in an isolated lab/administrative environment.
 
 ---
 
