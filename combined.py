@@ -9,7 +9,7 @@ collection stages behind a single authentication:
   - Stage 1: full operational data collection (produces the Stage 1 archive).
   - Stage 2: configuration backup collection (produces the Stage 2 archive).
 
-The user provides only: manager IP address, port, username and password.
+The user provides only: manager IP address or FQDN, port, username and password.
 SSL verification is disabled (intended for isolated lab environments).
 
 A SINGLE login is performed: one j_security_check + token retrieval. The
@@ -430,13 +430,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Combined SD-WAN collector (single login)."
     )
-    parser.add_argument("-a", "--address", help="SD-WAN Manager IP address")
+    parser.add_argument("-a", "--address", help="SD-WAN Manager IP address or FQDN")
     parser.add_argument("--port", default="443", help="SD-WAN Manager port (default: 443)")
     parser.add_argument("-u", "--user", help="SD-WAN Manager username")
     parser.add_argument("-p", "--password", help="SD-WAN Manager password")
     args = parser.parse_args()
 
-    address = args.address or input("Enter SD-WAN Manager IP address: ").strip()
+    address = args.address or input("Enter SD-WAN Manager IP or FQDN: ").strip()
     if args.port == "":
         port = input("Enter port [443]: ").strip() or "443"
     else:
