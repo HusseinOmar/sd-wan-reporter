@@ -1,0 +1,1369 @@
+"""
+ Sastre - Cisco-SDWAN Automation Toolset
+
+ cisco_sdwan.base.models_base
+ This module implements SD-WAN Manager base API models
+"""
+import json
+import re
+from os import environ
+from pathlib import Path
+from itertools import zip_longest
+from collections import namedtuple
+from dataclasses import dataclass
+from typing import Any, Optional, NamedTuple
+from types import EllipsisType
+from collections.abc import Mapping, Sequence, Iterator, Generator, Callable
+from operator import attrgetter
+from datetime import datetime, timezone
+from urllib.parse import quote_plus
+from pydantic import ConfigDict, BaseModel, Field
+from requests.exceptions import Timeout
+from .rest_api import RestAPIException, Rest, is_version_newer
+
+# Top-level directory for the local data store
+DATA_ROOT_DIR = Path(environ.get('SDWAN_DATA_ROOT', environ.get('SASTRE_ROOT_DIR', Path.cwd())))
+SASTRE_ROOT_DIR = DATA_ROOT_DIR
+DATA_DIR = str(Path(DATA_ROOT_DIR, 'data'))
+
+
+# Used for IndexConfigItem iter_fields when they follow (<item-id-label>, <item-name-label>) format
+IdName = namedtuple('IdName', ['id', 'name'])
+
+
+class UpdateEval:
+    def __init__(self, data):
+        self.is_policy = isinstance(data, list)
+        # Master template updates (PUT requests) return a dict containing a 'data' key. Non-master templates don't.
+        self.is_master = isinstance(data, dict) and 'data' in data
+
+        # This is to homogenize the response payload variants
+        self.data = data.get('data', {}) if self.is_master else data
+
+    @property
+    def need_reattach(self):
+        return not self.is_policy and 'processId' in self.data
+
+    @property
+    def need_reactivate(self):
+        return self.is_policy and len(self.data) > 0
+
+    def templates_affected_iter(self):
+        return iter(self.data.get('masterTemplatesAffected', []))
+
+    def __str__(self):
+        return json.dumps(self.data, indent=2)
+
+    def __repr__(self):
+        return json.dumps(self.data)
+
+
+class ApiPath:
+    """
+    Groups the API path for different operations available in an API item (i.e., get, post, put, delete).
+    Each field contains a str with the API path, or None if the particular operations are not supported on this item.
+    """
+    __slots__ = ('path_vars', 'get', 'post', 'put', 'delete')
+
+    def __init__(self, get: str | None, *other_ops: str | None, path_vars: Optional[Sequence[str]] = None) -> None:
+        """
+        @param get: URL path for get operations
+        @param other_ops: URL path for post, put and delete operations, in this order. If an item is not specified,
+                          the same URL as the last operation provided is used.
+        @param path_vars: Path variable names that may be present in defined paths. It is assumed that all methods have
+                          the same path variables.
+        """
+        if len(other_ops) > len(self.__slots__) - 2:
+            raise ValueError(f"Too many operations provided: {other_ops}")
+
+        self.get = get
+        last_op = other_ops[-1] if other_ops else get
+        for field, value in zip_longest(self.__slots__[2:], other_ops, fillvalue=last_op):
+            setattr(self, field, value)
+
+        if path_vars is None:
+            for value in (getattr(self, field) for field in self.__slots__[1:]):
+                if value is not None:
+                    # The first valid path becomes the reference to discover path variables
+                    self.path_vars = ApiPath.discover_path_vars(value)
+                    break
+            else:
+                self.path_vars = None
+        else:
+            self.path_vars = tuple(path_vars)
+
+    def resolve(self, *var_values: str, **var_mappings: str) -> 'ApiPath':
+        """
+        Resolve an API Path containing path variables (ex. /v1/config/{config_id}/etc) into a concrete API path with
+        path variables replaced with their values, as provided via var_values or var_mappings.
+        @param var_values: Values for path variables, in the same order in which they are defined.
+        @param var_mappings: Key-value pairs associating values with path variable names.
+        @return: A new ApiPath instance containing path variables replaced with their values.
+        """
+        if not self.path_vars:
+            return self
+
+        if not var_mappings and len(self.path_vars) != len(var_values):
+            raise ValueError(f"Unexpected var values provided: {', '.join(var_values) or 'None provided'} [{self}]")
+        if not var_values and set(self.path_vars) != var_mappings.keys():
+            raise ValueError(f"Unexpected var mappings provided: {', '.join(var_mappings) or 'None provided'} [{self}]")
+
+        var_bindings = var_mappings or dict(zip(self.path_vars, var_values))
+        # Ensure provided values are url-safe
+        var_bindings = {name: quote_plus(value) for name, value in var_bindings.items()}
+
+        def resolve_path(field):
+            path = getattr(self, field)
+            return path.format(**var_bindings) if path is not None else None
+
+        return ApiPath(*tuple(resolve_path(field) for field in self.__slots__[1:]))
+
+    def __repr__(self) -> str:
+        path_vars = f", path_vars=[{', '.join(self.path_vars)}]" if self.path_vars else ""
+        return f"{self.__class__.__name__}({self.get}, {self.post}, {self.put}, {self.delete}{path_vars})"
+
+    @staticmethod
+    def discover_path_vars(path_template: str) -> tuple[str, ...]:
+        # If no path variable is discovered, an empty tuple is returned
+        return tuple(m.group(1) for m in re.finditer(r'{\s*([^}\s][^}]*?)\s*}', path_template))
+
+
+class CliOrFeatureApiPath:
+    def __init__(self, api_path_feature, api_path_cli):
+        self.api_path_feature = api_path_feature
+        self.api_path_cli = api_path_cli
+
+    def __get__(self, instance, owner):
+        # If called from the class, assume it is a feature template
+        is_cli_template = instance is not None and instance.is_type_cli
+
+        return self.api_path_cli if is_cli_template else self.api_path_feature
+
+
+class PathKey(NamedTuple):
+    """
+    PathKey tuples are used to look up api paths in ApiPathGroup
+    """
+    parcel_type: str
+    parent_parcel_type: Optional[str] = None
+
+
+class ApiPathGroup:
+    """
+    ApiPathGroup is used on feature profiles and contains mapping of parcelType to ApiPath. ApiPaths relative to parcel
+    references are registered using the optional parcel_reference_path_map.
+    """
+    def __init__(self, path_map: Mapping[str, ApiPath | EllipsisType],
+                 parcel_reference_path_map: Optional[Mapping[PathKey, ApiPath | EllipsisType]] = None) -> None:
+        """
+        @param path_map: Register parcel ApiPaths to a feature profile. Mapping of {<parcelType>: ApiPath, ... }
+        @param parcel_reference_path_map: Register parcel reference ApiPaths to a feature profile. Mapping of
+                                          {PathKey(<ParcelType>, <parent ParcelType>): ApiPath, ...}
+                                          If ... is used instead of an ApiPath, it means that this reference parcel
+                                          doesn't need to be explicitly created (thus no ApiPath is provided).
+        """
+        self._path_map = dict(path_map)
+        self._parcel_ref_map = dict(parcel_reference_path_map) if parcel_reference_path_map is not None else {}
+        self._referenced_types = {path_key.parcel_type for path_key in self._parcel_ref_map}
+        self._parent_types = {path_key.parent_parcel_type
+                              for path_key in self._parcel_ref_map if path_key.parent_parcel_type is not None}
+
+    def api_path(self, key: PathKey) -> tuple[ApiPath | EllipsisType | None, bool]:
+        """
+        Returns the api path associated with the provided key, along with whether this is a parcel reference or an
+        actual parcel.
+        @param key: A PathKey to find the api path
+        @return: (<parcel api path>, <is reference>) tuple.
+        """
+        parcel_reference_path = self._parcel_ref_map.get(key)
+        if parcel_reference_path is not None:
+            # parcel_reference_path can be an ApiPath or ...
+            return parcel_reference_path, True
+
+        return self._path_map.get(key.parcel_type), False
+
+    def is_referenced_type(self, parcel_type: str) -> bool:
+        """
+        Indicates whether the provided parcel_type is a type that can be referenced
+        @param parcel_type: Parcel type
+        @return: True if this parcel type is one that can be referenced, False otherwise
+        """
+        return parcel_type in self._referenced_types
+
+    def is_parent_type(self, parcel_type: str) -> bool:
+        """
+        Indicates whether the provided parcel_type is a parent of a type that can be referenced
+        @param parcel_type: Parcel type
+        @return: True if this parcel type is a parent of one that can be referenced, False otherwise
+        """
+        return parcel_type in self._parent_types
+
+
+class OperationalItem:
+    """
+    Base class for operational data API elements
+    """
+    api_path = None
+    api_params = None
+    fields_std = None  # Tuple with standard fields to include (by default) as entries are iterated
+    fields_ext = None  # Tuple with extended fields to add, on top of fields_std
+    fields_sub = None  # Tuple containing fields to subtract from fields_std as entries are iterated
+    field_conversion_fns = {}
+
+    _FALLBACK_TITLE_SUBSTITUTIONS = {
+        'vdevice-name': 'System Ip'
+    }
+
+    def __init__(self, payload: Mapping[str, Any]) -> None:
+        def format_title(title: str) -> str:
+            # If it is a dotted string, keep the last segment only. Ex. device.control.dataControlWanInterface.interface
+            formatted = title.split('.')[-1]
+            # Replace camelCase with camel Case
+            formatted = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', formatted)
+
+            return formatted.title()
+
+        def format_fallback_title(p_name: str) -> str:
+            substitution = self._FALLBACK_TITLE_SUBSTITUTIONS.get(p_name.lower())
+            return substitution if substitution is not None else p_name.replace('_', ' ').title()
+
+        self.timestamp = payload['header']['generatedOn']
+
+        self._data = payload['data']
+
+        # Some SD-WAN Manager endpoints don't provide all properties in the 'columns' list, which is where 'title' is
+        # defined. For those properties without a title, infer one based on the property name.
+        self._meta = {attribute_safe(field['property']): field for field in payload['header']['fields']}
+        title_dict = {
+            attribute_safe(field['property']): format_title(field['title'])
+            for field in payload['header']['columns']
+        }
+        for field_property, field in self._meta.items():
+            field['title'] = title_dict.get(field_property, format_fallback_title(field['property']))
+
+    @property
+    def field_names(self) -> tuple[str, ...]:
+        return tuple(self._meta.keys())
+
+    def field_info(self, *field_names: str, info: str = 'title', default: str | None = 'N/A') -> tuple[Any, ...]:
+        """
+        Retrieve metadata about one or more fields.
+        @param field_names: One or more field names to retrieve metadata from.
+        @param info: Indicate which metadata to retrieve. By default, the field title will be returned.
+        @param default: Value to be returned when a field_name does not exist.
+        @return: tuple with one or more elements representing the desired metadata for each field requested.
+        """
+        if len(field_names) == 1:
+            return self._meta.get(field_names[0], {}).get(info, default),
+
+        return tuple(entry.get(info, default) for entry in default_getter(*field_names, default={})(self._meta))
+
+    def field_value_iter(self, *field_names: str,
+                         **conv_fn_map: Mapping[str, Callable[..., Any]]) -> Iterator[tuple[Any, ...]]:
+        """
+        Iterate over entries of an operational item instance. Only fields/columns defined by field_names are yielded.
+        Type conversion of one or more fields is supported by passing a callable that takes one argument (the field
+        value) and returns the converted value. E.g., passing average_latency=int will convert a string average_latency
+        field to an integer.
+        @param field_names: Specify one or more field names to retrieve.
+        @param conv_fn_map: Keyword arguments passed allow type conversions on fields.
+        @return: A FieldValue object (named tuple) with attributes for each field_name.
+        """
+        FieldValue = namedtuple('FieldValue', field_names)
+
+        def default_conv_fn(field_val):
+            return field_val if field_val is not None else ''
+
+        conv_fn_list = [conv_fn_map.get(field_name, default_conv_fn) for field_name in field_names]
+        field_properties = self.field_info(*field_names, info='property', default=None)
+
+        # noinspection PyProtectedMember
+        def getter_fn(obj):
+            return FieldValue._make(
+                conv_fn(obj.get(field_property)) if field_property is not None else 'N/A'
+                for conv_fn, field_property in zip(conv_fn_list, field_properties)
+            )
+
+        return (getter_fn(entry) for entry in self._data)
+
+    @classmethod
+    def get(cls, api: Rest, *args, **kwargs):
+        try:
+            instance = cls.get_raise(api, *args, **kwargs)
+            return instance
+        except (RestAPIException, Timeout):
+            # Timeouts are more common with operational items, while less severe. Capturing here to allow execution to
+            # proceed and not fail the whole task
+            return None
+
+    @classmethod
+    def get_raise(cls, api: Rest, *args, **kwargs):
+        raise NotImplementedError()
+
+    def __str__(self) -> str:
+        return json.dumps(self._data, indent=2)
+
+    def __repr__(self) -> str:
+        return json.dumps(self._data)
+
+
+class RealtimeItem(OperationalItem):
+    """
+    RealtimeItem represents an SD-WAN Manager realtime monitoring API element defined by an ApiPath with a GET path.
+    An instance of this class can be created to retrieve and parse realtime endpoints.
+    """
+    api_params = ('deviceId',)
+
+    def __init__(self, payload: Mapping[str, Any]) -> None:
+        super().__init__(payload)
+
+    @classmethod
+    def get_raise(cls, api: Rest, *args, **kwargs):
+        params = kwargs or dict(zip(cls.api_params, args))
+        return cls(api.get(cls.api_path.get, **params))
+
+    @classmethod
+    def is_in_scope(cls, device_model: str) -> bool:
+        """
+        Indicates whether this RealtimeItem is applicable to a particular device model. Subclasses need to overwrite
+        this method when the realtime api endpoint that it represents is specific to certain device models. For example,
+        vEdge vs. cEdges.
+        """
+        return True
+
+
+class BulkStatsItem(OperationalItem):
+    """
+    BulkStatsItem represents an SD-WAN Manager bulk statistics API element defined by an ApiPath with a GET path.
+    It supports SD-WAN Manager pagination protocol internally, abstracting it from the user.
+    An instance of this class can be created to retrieve and parse bulk statistics endpoints.
+    """
+    api_params = ('endDate', 'startDate', 'count', 'timeZone')
+    fields_to_avg = tuple()
+    field_node_id = 'vdevice_name'
+    field_entry_time = 'entry_time'
+
+    def __init__(self, payload: Mapping[str, Any]) -> None:
+        super().__init__(payload)
+        self._page_info = payload['pageInfo']
+
+    @property
+    def next_page(self) -> str | None:
+        return self._page_info['scrollId'] if self._page_info['hasMoreData'] else None
+
+    def add_payload(self, payload: Mapping[str, Any]) -> None:
+        self._data.extend(payload['data'])
+        self._page_info = payload['pageInfo']
+
+    @classmethod
+    def get_raise(cls, api: Rest, *args, **kwargs):
+        params = kwargs or dict(zip(cls.api_params, args))
+        obj = cls(api.get(cls.api_path.get, **params))
+        while True:
+            next_page = obj.next_page
+            if next_page is None:
+                break
+            payload = api.get(cls.api_path.get, scrollId=next_page)
+            obj.add_payload(payload)
+
+        return obj
+
+    @staticmethod
+    def time_series_key(sample: tuple[Any, ...]) -> str:
+        """
+        Default key used to split a BulkStatsItem into its different time series. Subclasses need to override this as
+        needed for the particular endpoint in question
+        """
+        return sample.vdevice_name
+
+    @staticmethod
+    def last_n_secs(n_secs: int, sample_list: Sequence[tuple[Any, ...]]) -> Iterator[tuple[Any, ...]]:
+        if not sample_list:
+            return
+        yield sample_list[0]
+
+        oldest_ts = sample_list[0].entry_time - n_secs * 1000
+        for sample in sample_list[1:]:
+            if sample.entry_time < oldest_ts:
+                break
+            yield sample
+
+    @staticmethod
+    def average_fields(sample_list: Sequence[tuple[Any, ...]], *fields_to_avg: str) -> dict[str, Any]:
+        def average(values):
+            avg = sum(values) / len(values)
+            # If original values were integer, convert average back to integer
+            return round(avg) if isinstance(values[0], int) else avg
+
+        values_get_fn = attrgetter(*fields_to_avg)
+        values_iter = (values_get_fn(sample) for sample in sample_list)
+
+        return dict(zip(fields_to_avg, (average(field_samples) for field_samples in zip(*values_iter))))
+
+    # noinspection PyProtectedMember
+    def aggregated_value_iter(self, interval_secs: int, *field_names: str,
+                              **conv_fn_map: Mapping[str, Callable[..., Any]]) -> Iterator[tuple[Any, ...]]:
+        """
+        Iterate over aggregated values off the different time series from this BulkStatsItem. Time series are identified
+        using time_series_key.
+
+        Aggregation is performed as follows:
+        - Fields in field_names that are in self.fields_to_avg are averaged over interval_secs.
+        - For remaining fields, the newest sample is used.
+
+        @param interval_secs: Interval to aggregate samples.
+        @param field_names: Desired field names to return on each iteration
+        @param conv_fn_map: Conversion functions to be applied to fields. Before they are aggregated.
+        @return: Iterator of namedtuple, each instance corresponding to a time series.
+        """
+        # Split bulk stats samples into different time series
+        time_series_dict = {}
+        for sample in self.field_value_iter(self.field_entry_time, *field_names, **conv_fn_map):
+            time_series_dict.setdefault(self.time_series_key(sample), []).append(sample)
+
+        # Sort each time series by entry_time with the newest samples first
+        sort_key = attrgetter(self.field_entry_time)
+        for time_series in time_series_dict.values():
+            time_series.sort(key=sort_key, reverse=True)
+
+        # Aggregation over newest n samples
+        Aggregate = namedtuple('Aggregate', field_names)
+        values_get_fn = attrgetter(*field_names)
+        fields_to_avg = set(field_names) & set(self.fields_to_avg)
+        for time_series in time_series_dict.values():
+            if not time_series:
+                continue
+
+            series_last_n = list(self.last_n_secs(interval_secs, time_series))
+            newest_sample = Aggregate._make(values_get_fn(series_last_n[0]))
+
+            if fields_to_avg:
+                yield newest_sample._replace(**self.average_fields(series_last_n, *fields_to_avg))
+            else:
+                yield newest_sample
+
+
+class BulkStateItem(OperationalItem):
+    """
+    BulkStateItem represents an SD-WAN Manager bulk state API element defined by an ApiPath with a GET path. It supports
+    SD-WAN Manager pagination protocol internally, abstracting it from the user.
+    An instance of this class can be created to retrieve and parse bulk state endpoints.
+    """
+    api_params = ('count',)
+    field_node_id = 'vdevice_name'
+
+    def __init__(self, payload: Mapping[str, Any]) -> None:
+        super().__init__(payload)
+        self._page_info = payload['pageInfo']
+
+    @property
+    def next_page(self) -> str | None:
+        return self._page_info['endId'] if self._page_info['moreEntries'] else None
+
+    def add_payload(self, payload: Mapping[str, Any]) -> None:
+        self._data.extend(payload['data'])
+        self._page_info = payload['pageInfo']
+
+    @property
+    def page_item_count(self) -> int:
+        return self._page_info['count']
+
+    @classmethod
+    def get_raise(cls, api: Rest, *args, **kwargs):
+        params = kwargs or dict(zip(cls.api_params, args))
+        obj = cls(api.get(cls.api_path.get, **params))
+        while True:
+            next_page = obj.next_page
+            if next_page is None:
+                break
+            payload = api.get(cls.api_path.get, startId=next_page, count=obj.page_item_count)
+            obj.add_payload(payload)
+
+        return obj
+
+
+def entry_time_parse(timestamp: str) -> datetime:
+    return datetime.fromtimestamp(float(timestamp) / 1000, tz=timezone.utc)
+
+
+class RecordItem(OperationalItem):
+    # Datetime string format used in log item queries
+    TIME_FORMAT = "%Y-%m-%dT%H:%M:%S %Z"
+    QUERY_SIZE_MAX = 10000
+
+    def __init__(self, payload: Mapping[str, Any]) -> None:
+        super().__init__(payload)
+        self._page_info = payload['pageInfo']
+
+    @staticmethod
+    def query(start_time: datetime, end_time: datetime, size: int) -> dict[str, Any]:
+        """
+        @param start_time: Starting date time for the query, i.e., oldest.
+        @param end_time: End date time for the query, i.e., newest.
+        @param size: Number of records to return. Positive integer.
+        @return: Query payload used to retrieve log items
+        """
+        return {
+            "size": RecordItem.QUERY_SIZE_MAX if size > RecordItem.QUERY_SIZE_MAX else size,
+            "query": {
+                "condition": "AND",
+                "rules": [
+                    {
+                        "field": "entry_time",
+                        "type": "date",
+                        "value": [
+                            start_time.strftime(RecordItem.TIME_FORMAT),
+                            end_time.strftime(RecordItem.TIME_FORMAT)
+                        ],
+                        "operator": "between"
+                    }
+                ]
+            },
+            "sort": [
+                {
+                    "field": "entry_time",
+                    "type": "date",
+                    "order": "desc"
+                }
+            ]
+        }
+
+    @property
+    def next_page(self) -> datetime | None:
+        if 'endTime' not in self._page_info or self.page_item_count < RecordItem.QUERY_SIZE_MAX:
+            return None
+
+        # endTime is provided as string in timestamp format
+        return entry_time_parse(self._page_info['endTime'])
+
+    def add_payload(self, payload: Mapping[str, Any]) -> None:
+        self._data.extend(payload['data'])
+        self._page_info = payload['pageInfo']
+
+    @property
+    def page_item_count(self) -> int:
+        return self._page_info['count']
+
+    @classmethod
+    def get_raise(cls, api: Rest, *, start_time: datetime, end_time: datetime, max_records: int):
+        obj = cls(api.post(cls.query(start_time, end_time, max_records), cls.api_path.post))
+        while True:
+            next_page = obj.next_page
+            if next_page is None:
+                break
+
+            payload = api.post(cls.query(start_time, next_page, max_records - len(obj._data)), cls.api_path.post)
+            obj.add_payload(payload)
+
+        return obj
+
+
+def attribute_safe(raw_attribute):
+    return re.sub(r'\W', '_', raw_attribute, flags=re.ASCII)
+
+
+class ApiItem:
+    """
+    ApiItem represents an SD-WAN Manager API element defined by an ApiPath with GET, POST, PUT and DELETE paths.
+    An instance of this class can be created to store the contents of that SD-WAN Manager API element (self.data field).
+    """
+    api_path = None  # An ApiPath instance
+    id_tag = None
+    name_tag = None
+
+    def __init__(self, data):
+        """
+        @param data: dict containing the information to be associated with this api item
+        """
+        self.data = data
+
+    @property
+    def uuid(self):
+        return self.data[self.id_tag] if self.id_tag is not None else None
+
+    @property
+    def name(self):
+        return self.data[self.name_tag] if self.name_tag is not None else None
+
+    @property
+    def is_empty(self):
+        return self.data is None or len(self.data) == 0
+
+    @classmethod
+    def get(cls, api: Rest, *args, **kwargs):
+        try:
+            return cls.get_raise(api, *args, **kwargs)
+        except RestAPIException:
+            return None
+
+    @classmethod
+    def get_raise(cls, api: Rest, *args, **kwargs):
+        # Extract path vars from kwargs, what is left becomes query vars
+        path_vars_map = {}
+        if cls.api_path.path_vars is not None:
+            for path_var in cls.api_path.path_vars:
+                path_var_value = kwargs.pop(path_var, None)
+                if path_var_value is not None:
+                    path_vars_map[path_var] = path_var_value
+
+        return cls(api.get(cls.api_path.resolve(**path_vars_map).get, *args, **kwargs))
+
+    def __str__(self):
+        return json.dumps(self.data, indent=2)
+
+    def __repr__(self):
+        return json.dumps(self.data)
+
+
+class IndexApiItem(ApiItem):
+    """
+    IndexApiItem is an index-type ApiItem that can be iterated, returning iter_fields
+    """
+
+    def __init__(self, data):
+        """
+        @param data: dict containing the information to be associated with this API item.
+        """
+        super().__init__(data.get('data') if isinstance(data, dict) else data)
+
+    # Iter_fields should be defined in subclasses and needs to be a tuple subclass.
+    iter_fields = None
+    # Extended_iter_fields should be defined in subclasses that use extended_iter, needs to be a tuple subclass.
+    extended_iter_fields = None
+
+    def iter(self, *iter_fields: str, default: Any = None) -> Iterator[Any]:
+        """
+        Returns an iterator where each entry is the value of the respective field in iter_fields.
+        @param default: Value to return for any field missing in an entry. Default is None.
+        @return: Iterator of entries in the index object
+        """
+        return (default_getter(*iter_fields, default=default)(entry) for entry in self.data)
+
+    def __iter__(self):
+        return self.iter(*self.iter_fields)
+
+    def extended_iter(self, default: Any = None) -> Iterator[Any]:
+        """
+        Returns an iterator where each entry is composed of the combined fields of iter_fields and extended_iter_fields.
+        None is returned on any fields that are missing in an entry
+        @param default: Value to return for any field missing in an entry. Default is None.
+        @return: Iterator of entries in the index object
+        """
+        return self.iter(*self.iter_fields, *self.extended_iter_fields, default=default)
+
+
+class ConfigItem(ApiItem):
+    """
+    ConfigItem is an ApiItem that can be backed up and restored
+    """
+    store_path = None
+    store_file = '{item_name}.json'
+    root_dir = DATA_DIR
+    factory_default_tag = 'factoryDefault'
+    readonly_tag = 'readOnly'
+    owner_tag = 'owner'
+    info_tag = 'infoTag'
+    type_tag = None
+    post_filtered_tags = None
+    skip_cmp_tag_set = set()
+    name_check_regex = re.compile(r'^[^&<>! "]{1,128}$')
+
+    def is_equal(self, other_payload: Mapping[str, Any]) -> bool:
+        exclude_set = self.skip_cmp_tag_set | {self.id_tag}
+
+        local_cmp_dict = {k: v for k, v in self.data.items() if k not in exclude_set}
+        other_cmp_dict = {k: v for k, v in other_payload.items() if k not in exclude_set}
+
+        return sorted(json.dumps(local_cmp_dict)) == sorted(json.dumps(other_cmp_dict))
+
+    @property
+    def is_readonly(self):
+        return self.data.get(self.factory_default_tag, False) or self.data.get(self.readonly_tag, False)
+
+    @property
+    def is_system(self):
+        return self.data.get(self.owner_tag, '') == 'system' or self.data.get(self.info_tag, '') == 'aci'
+
+    @property
+    def type(self):
+        return self.data.get(self.type_tag)
+
+    @classmethod
+    def get_filename(cls, ext_name, item_name, item_id):
+        if item_name is None or item_id is None:
+            # Assume store_file does not have variables
+            return cls.store_file
+
+        safe_name = filename_safe(item_name) if not ext_name else '{name}_{uuid}'.format(name=filename_safe(item_name),
+                                                                                         uuid=item_id)
+        return cls.store_file.format(item_name=safe_name, item_id=item_id)
+
+    @classmethod
+    def load(cls, node_dir, ext_name=False, item_name=None, item_id=None, raise_not_found=False, use_root_dir=True):
+        """
+        Factory method that loads data from a JSON file and returns a ConfigItem instance with that data
+
+        @param node_dir: String indicating a directory under root_dir used for all files from an SD-WAN Manager node.
+        @param ext_name: True indicates that item_names need to be extended (with item_id) to make their
+                         filename safe version unique. False otherwise.
+        @param item_name: (Optional) Name of the item being loaded. Variable used to build the filename.
+        @param item_id: (Optional) UUID for the item being loaded. Variable used to build the filename.
+        @param raise_not_found: (Optional) If set to True, raise FileNotFoundError if the file is not found.
+        @param use_root_dir: True indicates that node_dir is under the root_dir. When false, the item should be located
+                             directly under node_dir/store_path
+        @return: ConfigItem object, or None if the file does not exist and raise_not_found=False
+        """
+        dir_path = Path(cls.root_dir, node_dir, *cls.store_path) if use_root_dir else Path(node_dir, *cls.store_path)
+        file_path = dir_path.joinpath(cls.get_filename(ext_name, item_name, item_id))
+        try:
+            with open(file_path, 'r') as read_f:
+                data = json.load(read_f)
+        except FileNotFoundError:
+            if raise_not_found:
+                has_detail = item_name is not None and item_id is not None
+                detail = f': {item_name}, {item_id}' if has_detail else ''
+                raise FileNotFoundError(f'{cls.__name__} file not found{detail}') from None
+            return None
+        except json.decoder.JSONDecodeError as ex:
+            raise ModelException(f'Invalid JSON file: {file_path}: {ex}') from None
+        else:
+            return cls(data)
+
+    def save(self, node_dir, ext_name=False, item_name=None, item_id=None):
+        """
+        Save data (i.e., self.data) to a JSON file
+
+        @param node_dir: String indicating a directory under root_dir used for all files from a given SD-WAN Manager.
+        @param ext_name: True indicates that item_names need to be extended (with item_id) to make their
+                         filename safe version unique. False otherwise.
+        @param item_name: (Optional) Name of the item being saved. Variable used to build the filename.
+        @param item_id: (Optional) UUID for the item being saved. Variable used to build the filename.
+        @return: True indicates data has been saved. False indicates no data to save (and no file has been created).
+        """
+        if self.is_empty:
+            return False
+
+        dir_path = Path(self.root_dir, node_dir, *self.store_path)
+        dir_path.mkdir(parents=True, exist_ok=True)
+
+        with open(dir_path.joinpath(self.get_filename(ext_name, item_name, item_id)), 'w') as write_f:
+            write_f.write(json.dumps(self.data, indent=2))
+
+        return True
+
+    def post_data(self, id_mapping_dict: Optional[Mapping[str, str]] = None) -> dict[str, Any]:
+        """
+        Build payload to be used for POST requests against this config item. From "self.data", perform item id
+        replacements defined in id_mapping_dict, also remove item id and rename it with new_name (if provided).
+        @param id_mapping_dict: {<old item id>: <new item id>} dict. If provided, <old item id> matches are replaced
+                                with <new item id>
+        @return: dict containing payload for POST requests
+        """
+        # Delete keys that shouldn't be on post requests
+        filtered_keys = {
+            self.id_tag,
+            '@rid',
+            'createdBy',
+            'createdOn',
+            'lastUpdatedBy',
+            'lastUpdatedOn'
+        }
+        if self.post_filtered_tags is not None:
+            filtered_keys.update(self.post_filtered_tags)
+        post_dict = {k: v for k, v in self.data.items() if k not in filtered_keys}
+
+        # Clear read-only flags
+        if post_dict.get(self.factory_default_tag, False):
+            post_dict[self.factory_default_tag] = False
+        if post_dict.get(self.readonly_tag, False):
+            post_dict[self.readonly_tag] = False
+
+        if id_mapping_dict is None:
+            return post_dict
+
+        return update_ids(id_mapping_dict, post_dict)
+
+    def put_data(self, id_mapping_dict: Optional[Mapping[str, str]] = None) -> dict[str, Any]:
+        """
+        Build payload to be used for PUT requests against this config item. From "self.data", perform item id
+        replacements defined in id_mapping_dict.
+        @param id_mapping_dict: {<old item id>: <new item id>} dict. If provided, <old item id> matches are replaced
+                                with <new item id>
+        @return: dict containing payload for PUT requests
+        """
+        filtered_keys = {
+            '@rid',
+            'createdBy',
+            'createdOn',
+            'lastUpdatedBy',
+            'lastUpdatedOn'
+        }
+        if self.post_filtered_tags is not None:
+            filtered_keys.update(self.post_filtered_tags)
+        put_dict = {k: v for k, v in self.data.items() if k not in filtered_keys}
+
+        if id_mapping_dict is None:
+            return put_dict
+
+        return update_ids(id_mapping_dict, put_dict)
+
+    @property
+    def id_references_set(self):
+        """
+        Return all references to other item ids by this item
+        @return: Set containing id-based references
+        """
+        filtered_keys = {
+            self.id_tag,
+        }
+        filtered_data = {k: v for k, v in self.data.items() if k not in filtered_keys}
+
+        return set(re.findall(r'[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}',
+                              json.dumps(filtered_data)))
+
+    @property
+    def crypt_cluster_values(self) -> Iterator[str]:
+        """
+        Extracts values that have been encrypted by SD-WAN Manager. That is, with a $CRYPT_CLUSTER$ prefix.
+        """
+        yield from re.findall(r'\$CRYPT_CLUSTER\$.+?(?=["\s\\])', json.dumps(self.data))
+
+    @classmethod
+    def is_name_valid(cls, proposed_name: Optional[str]) -> bool:
+        return proposed_name is not None and cls.name_check_regex.search(proposed_name) is not None
+
+    def find_key(self, key, from_key=None):
+        """
+        Returns a list containing the values from all occurrences of key inside data. Matched values that are dict or
+        list are not included.
+        @param key: Key to search
+        @param from_key: Top-level key under which to start the search
+        @return: List
+        """
+        match_list = []
+
+        def find_in(json_obj):
+            if isinstance(json_obj, dict):
+                matched_val = json_obj.get(key)
+                if matched_val is not None and not isinstance(matched_val, dict) and not isinstance(matched_val, list):
+                    match_list.append(matched_val)
+                for value in json_obj.values():
+                    find_in(value)
+
+            elif isinstance(json_obj, list):
+                for elem in json_obj:
+                    find_in(elem)
+
+            return match_list
+
+        return find_in(self.data) if from_key is None else find_in(self.data[from_key])
+
+
+class IndexConfigItem(ConfigItem):
+    """
+    IndexConfigItem is an index-type ConfigItem that can be iterated, returning iter_fields
+    """
+    def __init__(self, data):
+        """
+        @param data: dict containing the information to be associated with this configuration item.
+        """
+        super().__init__(data.get('data') if isinstance(data, dict) else data)
+
+        # When iter_fields is a regular tuple, it is completely opaque. However, if it is an IdName, then it triggers
+        # an evaluation of whether there is a collision amongst the filename_safe version of all names in this index.
+        # Need_extended_name = True indicates that there is collision and that extended names should be used when
+        # saving/loading to/from backup
+        if isinstance(self.iter_fields, IdName):
+            filename_safe_set = {filename_safe(item_name, lower=True) for item_name in self.iter(self.iter_fields.name)}
+            self.need_extended_name = len(filename_safe_set) != len(self.data)
+        else:
+            self.need_extended_name = False
+
+    # Iter_fields should be defined in subclasses and needs to be a tuple subclass.
+    # When it follows the format (<item-id>, <item-name>), use an IdName namedtuple instead of a regular tuple.
+    iter_fields = None
+    # Extended_iter_fields should be defined in subclasses that use extended_iter, needs to be a tuple subclass.
+    extended_iter_fields = None
+
+    store_path = ('inventory',)
+    store_file = None
+
+    @classmethod
+    def create(cls, item_list: Sequence[ConfigItem], id_hint_dict: Mapping[str, str]):
+        def index_entry_dict(item_obj: ConfigItem):
+            return {
+                key: item_obj.data.get(key, id_hint_dict.get(item_obj.name)) for key in cls.iter_fields
+            }
+
+        index_payload = {
+            'data': [index_entry_dict(item) for item in item_list]
+        }
+        return cls(index_payload)
+
+    def iter(self, *iter_fields: str, default: Any = None) -> Iterator[Any]:
+        """
+        Returns an iterator where each entry is the value of the respective field in iter_fields.
+        @param default: Value to return for any field missing in an entry. Default is None.
+        @return: Iterator of entries in the index object
+        """
+        return (default_getter(*iter_fields, default=default)(entry) for entry in self.data)
+
+    def __iter__(self):
+        return self.iter(*self.iter_fields)
+
+    def extended_iter(self, default: Any = None) -> Iterator[Any]:
+        """
+        Returns an iterator where each entry is composed of the combined fields of iter_fields and extended_iter_fields.
+        None is returned on any fields that are missing in an entry
+        @param default: Value to return for any field missing in an entry. Default is None.
+        @return: Iterator of entries in the index object
+        """
+        return self.iter(*self.iter_fields, *self.extended_iter_fields, default=default)
+
+
+class ConfigRequestModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+
+class FeatureProfileModel(ConfigRequestModel):
+    name: str
+    description: Optional[str] = None
+
+    def __init__(self, **kwargs):
+        # In 20.8.1 get profile contains 'profileName', while post/put requests require 'name' instead
+        name = kwargs.pop('name', None) or kwargs.pop('profileName', None)
+        if name is not None:
+            kwargs['name'] = name
+        # In 20.15, get profile may not contain 'description', while post/put requests require a 'description' field
+        if kwargs.get('description') is None:
+            kwargs['description'] = ''
+
+        super().__init__(**kwargs)
+
+
+class ProfileParcelPayloadModel(ConfigRequestModel):
+    name: str
+    description: str = ''
+    data: Optional[dict[str, Any]] = None
+
+
+class ProfileParcelModel(ConfigRequestModel):
+    parcelId: str
+    parcelType: str
+    createdBy: str = ''
+    payload: ProfileParcelPayloadModel
+    subparcels: list['ProfileParcelModel'] = Field(default_factory=list)
+
+    @property
+    def is_system(self):
+        return self.createdBy == 'system'
+
+
+class ProfileParcelReferenceModel(ConfigRequestModel):
+    parcelId: str
+
+
+class Config2Item(ConfigItem):
+    """
+    Config2Item is a specialized ConfigItem to support SD-WAN Manager Config 2.0 elements
+
+    """
+    post_model: Callable[..., ConfigRequestModel] = None
+    put_model: Optional[Callable[..., ConfigRequestModel]] = None
+    delete_model: Optional[Callable[..., ConfigRequestModel]] = None
+
+    def is_equal(self, other: Mapping[str, Any]) -> bool:
+        exclude_set = self.skip_cmp_tag_set | {self.id_tag}
+        put_model = self.put_model or self.post_model
+
+        local_cmp_dict = put_model(**self.data).model_dump(by_alias=True, exclude=exclude_set, exclude_none=True)
+        other_cmp_dict = {k: v for k, v in other.items() if k not in exclude_set}
+
+        return sorted(json.dumps(local_cmp_dict)) == sorted(json.dumps(other_cmp_dict))
+
+    def post_data(self, id_mapping_dict: Optional[Mapping[str, str]] = None) -> dict[str, Any]:
+        """
+        Build payload to be used for POST requests against this config item. From "self.data", perform item id
+        replacements defined in id_mapping_dict, also remove item id and rename with new_name (if provided).
+        @param id_mapping_dict: {<old item id>: <new item id>} dict. If provided, <old item id> matches are replaced
+                                with <new item id>
+        @return: dict containing payload for POST requests
+        """
+        return self._op_data(self.post_model, id_mapping_dict)
+
+    def put_data(self, id_mapping_dict: Optional[Mapping[str, str]] = None) -> dict[str, Any]:
+        """
+        Build payload to be used for PUT requests against this config item. From "self.data", perform item id
+        replacements defined in id_mapping_dict.
+        @param id_mapping_dict: {<old item id>: <new item id>} dict. If provided, <old item id> matches are replaced
+                                with <new item id>
+        @return: dict containing payload for PUT requests
+        """
+        put_model = self.put_model or self.post_model
+        return self._op_data(put_model, id_mapping_dict)
+
+    def delete_data(self, id_mapping_dict: Optional[Mapping[str, str]] = None) -> dict[str, Any]:
+        """
+        Build payload to be used for DELETE requests against this config item. From "self.data", perform item id
+        replacements defined in id_mapping_dict.
+        @param id_mapping_dict: {<old item id>: <new item id>} dict. If provided, <old item id> matches are replaced
+                                with <new item id>
+        @return: dict containing payload for DELETE requests
+        """
+        delete_model = self.delete_model or self.put_model or self.post_model
+        return self._op_data(delete_model, id_mapping_dict)
+
+    def _op_data(self, op_model: Callable[..., ConfigRequestModel],
+                 id_mapping_dict: Optional[Mapping[str, str]]) -> dict[str, Any]:
+        payload = op_model(**self.data)
+
+        if id_mapping_dict is None:
+            return payload.model_dump(by_alias=True, exclude_none=True)
+
+        return update_ids(id_mapping_dict, payload.model_dump(by_alias=True, exclude_none=True))
+
+
+@dataclass
+class ParcelInfo:
+    api_path: ApiPath
+    name: str
+    payload: dict[str, Any]
+    target_id: str | None
+    is_system: bool
+    is_reference: bool
+
+
+class FeatureProfile(Config2Item):
+    id_tag = 'profileId'
+    name_tag = 'profileName'
+    type_tag = 'profileType'
+    parcels_tag = 'associatedProfileParcels'
+    created_by_tag = 'createdBy'
+    parcel_api_paths: Optional[ApiPathGroup] = None
+    # When overwritten by subclasses, it specifies the order in which parcels need to be traversed during restore.
+    ordered_parcel_names: Optional[Sequence[str]] = None
+
+    post_model = FeatureProfileModel
+
+    def __init__(self, data):
+        super().__init__(data)
+
+        # {<old parcel id>: <new parcel id>} map used to update parcel references with the new parcel ids
+        self._id_mapping: dict[str, str] = {}
+        # similar to _id_mapping, but to allow id mapping across feature profiles.
+        self._global_id_mapping: dict[str, str] = {}
+
+        # Index dict used for defining traverse order. Used when ordered_parcel_names is provided
+        self._parcel_index = {parcel_name: index for index, parcel_name in enumerate(self.ordered_parcel_names or [])}
+
+    @property
+    def is_system(self):
+        return super().is_system or self.data.get(self.created_by_tag, '') == 'system'
+
+    def parcel_id_mapping(self) -> Iterator[tuple[str, str]]:
+        return ((old_parcel_id, new_parcel_id) for old_parcel_id, new_parcel_id in self._id_mapping.items())
+
+    def set_global_id_mapping(self, global_id_mapping: dict[str, str]):
+        self._global_id_mapping.update(global_id_mapping)
+
+    @property
+    def parsed_parcels(self) -> Iterator[ProfileParcelModel]:
+        return (ProfileParcelModel(**raw_parcel) for raw_parcel in self.data.get(self.parcels_tag, []))
+
+    def update_parcels_data(self, api: Rest, profile_id: str) -> None:
+        """
+        Updates feature profile internal data dictionary with parcel payload.
+        """
+        def eval_parcel(parcel: ProfileParcelModel, *element_ids: str, parent_parcel_type: Optional[str] = None):
+            api_path, _ = self.parcel_api_paths.api_path(PathKey(parcel.parcelType, parent_parcel_type))
+            if api_path is None:
+                raise ModelException(f"Parcel type {parcel.parcelType} is not supported")
+            if api_path is ...:
+                # This is a parcel reference no further processing is needed
+                return
+
+            if parcel.payload.data is None:
+                raw_single_parcel = api.get(api_path.resolve(*element_ids).get, parcel.parcelId)
+                parcel.payload.data = ProfileParcelModel(**raw_single_parcel).payload.data
+
+            new_element_ids = element_ids + (parcel.parcelId,)
+
+            for sub_parcel in parcel.subparcels:
+                eval_parcel(sub_parcel, *new_element_ids, parent_parcel_type=parcel.parcelType)
+
+        def eval_root_parcel(raw_parcel: Mapping[str, Any]) -> dict[str, Any]:
+            root_parcel = ProfileParcelModel(**raw_parcel)
+            eval_parcel(root_parcel, profile_id)
+
+            return root_parcel.model_dump(by_alias=True, exclude_none=True)
+
+        self.data[self.parcels_tag] = [
+            eval_root_parcel(raw_parcel) for raw_parcel in self.data.get(self.parcels_tag, [])
+        ]
+
+    def parcel_sort_key(self, parcel_obj: ProfileParcelModel) -> int:
+        def parcel_order_fallback(p_obj: ProfileParcelModel) -> int:
+            if self.parcel_api_paths.is_referenced_type(p_obj.parcelType):
+                if not self.parcel_api_paths.is_parent_type(p_obj.parcelType):
+                    return len(self._parcel_index)
+                if not p_obj.subparcels:
+                    return len(self._parcel_index) + 1
+                return len(self._parcel_index) + 2
+
+            return len(self._parcel_index) + 3
+
+        # Parcel ordering is defined by ordered_parcel_names. In case the parcelType is not in
+        # ordered_parcel_names, use parcel_order_fallback.
+        return self._parcel_index.get(parcel_obj.parcelType, parcel_order_fallback(parcel_obj))
+
+    def associated_parcels(self, new_profile_id: str, target_profile: Optional['FeatureProfile'] = None,
+                           delete_order: bool = False) -> Generator[ParcelInfo, str, None]:
+        target_parcels_dict: dict[str, ProfileParcelModel] = {
+            parcel_obj.payload.name: parcel_obj for parcel_obj in target_profile.parsed_parcels
+        } if target_profile is not None else {}
+
+        for root_parcel in sorted(self.parsed_parcels, key=self.parcel_sort_key, reverse=delete_order):
+            target_root_parcel = target_parcels_dict.get(root_parcel.payload.name)
+            if target_root_parcel is not None:
+                # Using the parcel with the same name on target SD-WAN Manager, update uuids
+                self._id_mapping[root_parcel.parcelId] = target_root_parcel.parcelId
+
+            # Traverse parcel tree under this root parcel
+            yield from self.profile_parcel_coro(
+                target_root_parcel or root_parcel, target_root_parcel is not None, new_profile_id
+            )
+
+    def profile_parcel_coro(self, parcel: ProfileParcelModel, is_target_parcel: bool, *element_ids: str,
+                            parent_parcel_type: Optional[str] = None) -> Generator[ParcelInfo, str, None]:
+        """
+        Iterate over Config 2.0 feature profile parcels, starting with the provided parcel and recursively checking
+        sub-parcels it may contain.
+        @param parcel: parcel to be iterated over
+        @param element_ids: Element IDs used to resolve path variables. The first one is the feature profile ID. Parcels
+                            with sub-parcels have their IDs included as well.
+        @param parent_parcel_type: Parcel type of the parent, or None if this is a root parcel
+        @yield: (<parcel api path>, <parcel info>, <parcel payload>) tuples
+        @send: New element id, used to resolve the api path
+        """
+        api_path, is_reference = self.parcel_api_paths.api_path(PathKey(parcel.parcelType, parent_parcel_type))
+        if api_path is None:
+            raise ModelException(f"Parcel type {parcel.parcelType} is not supported")
+        if api_path is ...:
+            # This is a parcel reference that doesn't need to be explicitly created, so no further processing is needed
+            return
+
+        combined_id_mapping: dict[str, str] = self._id_mapping | self._global_id_mapping
+
+        if is_reference:
+            if parcel.parcelId not in combined_id_mapping:
+                raise ModelException(f"{parcel.payload.name}: Referenced parcel ID not found: {parcel.parcelId}")
+
+            parcel_payload = ProfileParcelReferenceModel(parcelId=parcel.parcelId)
+        else:
+            parcel_payload = parcel.payload
+
+        new_element_id = yield ParcelInfo(
+            api_path=api_path.resolve(*element_ids),
+            name=parcel.payload.name,
+            payload=update_ids(combined_id_mapping, parcel_payload.model_dump(by_alias=True, exclude_none=True)),
+            target_id=parcel.parcelId if is_target_parcel else None,
+            is_system=parcel.is_system,
+            is_reference=is_reference
+        )
+
+        self._id_mapping[parcel.parcelId] = new_element_id
+        new_element_ids = element_ids + (new_element_id,)
+
+        for sub_parcel in sorted(parcel.subparcels, key=self.parcel_sort_key):
+            yield from self.profile_parcel_coro(
+                sub_parcel, is_target_parcel, *new_element_ids, parent_parcel_type=parcel.parcelType
+            )
+
+    @classmethod
+    def get_raise(cls, api: Rest, *args, **kwargs):
+        # Extract path vars from kwargs, what is left becomes query vars
+        path_vars_map = {}
+        if cls.api_path.path_vars is not None:
+            for path_var in cls.api_path.path_vars:
+                path_var_value = kwargs.pop(path_var, None)
+                if path_var_value is not None:
+                    path_vars_map[path_var] = path_var_value
+
+        fp_obj = cls(api.get(cls.api_path.resolve(**path_vars_map).get, *args, **kwargs))
+
+        # Special case for FeatureProfiles on 20.12 or newer, need to retrieve parcel data fields
+        if is_version_newer('20.11', api.server_version):
+            fp_obj.update_parcels_data(api, fp_obj.uuid)
+
+        return fp_obj
+
+
+class FeatureProfileIndex(IndexConfigItem):
+    iter_fields = IdName('profileId', 'profileName')
+
+
+class AdminSettingsItem(ConfigItem):
+    api_path = ApiPath('settings/configuration/{setting}')
+    store_path = ('settings',)
+    setting = None
+
+    def __init__(self, data):
+        """
+        @param data: dict containing the information to be associated with this API item.
+        """
+        # Get requests returns a dict as {'data': [{'domainIp': 'vbond.cisco.com', 'port': '12346'}]}
+        super().__init__(data.get('data', [''])[0])
+
+    @classmethod
+    def get_raise(cls, api: Rest, *args, **kwargs):
+        setting = kwargs.pop(cls.setting, None) or cls.setting
+
+        return super().get_raise(api, *args, setting=setting, **kwargs)
+
+
+class ServerInfo:
+    root_dir = DATA_DIR
+    store_file = 'server_info.json'
+
+    def __init__(self, **kwargs):
+        """
+        @param kwargs: key-value pairs of information about the SD-WAN Manager server
+        """
+        self.data = kwargs
+
+    def __getattr__(self, item):
+        attr = self.data.get(item)
+        if attr is None:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{item}'")
+        return attr
+
+    @classmethod
+    def load(cls, node_dir):
+        """
+        Factory method that loads data from a JSON file and returns a ServerInfo instance with that data
+
+        @param node_dir: String indicating a directory under root_dir used for all files from a given SD-WAN Manager.
+        @return: ServerInfo object, or None if the file does not exist
+        """
+        dir_path = Path(cls.root_dir, node_dir)
+        file_path = dir_path.joinpath(cls.store_file)
+        try:
+            with open(file_path, 'r') as read_f:
+                data = json.load(read_f)
+        except FileNotFoundError:
+            return None
+        except json.decoder.JSONDecodeError as ex:
+            raise ModelException(f"Invalid JSON file: {file_path}: {ex}") from None
+        else:
+            return cls(**data)
+
+    def save(self, node_dir):
+        """
+        Save data (i.e., self.data) to a JSON file
+
+        @param node_dir: String indicating a directory under root_dir used for all files from a given SD-WAN Manager.
+        @return: True indicates data has been saved. False indicates no data to save (and no file has been created).
+        """
+        dir_path = Path(self.root_dir, node_dir)
+        dir_path.mkdir(parents=True, exist_ok=True)
+
+        with open(dir_path.joinpath(self.store_file), 'w') as write_f:
+            write_f.write(json.dumps(self.data, indent=2))
+
+        return True
+
+
+def filename_safe(name: str, lower: bool = False) -> str:
+    """
+    Perform the necessary replacements in <name> to make it filename safe.
+    Any char that is not a-z, A-Z, 0-9, '_', ' ', or '-' is replaced with '_'. Convert to lowercase if lower=True.
+    @param lower: If True, apply str.lower() to the result.
+    @param name: name string to be converted
+    @return: string containing the filename-save version of item_name
+    """
+    # Inspired by Django's slugify function
+    cleaned = re.sub(r'[^\w\s-]', '_', name, flags=re.ASCII)
+    return cleaned.lower() if lower else cleaned
+
+
+def update_ids(id_map: Mapping[str, str], item_data: Mapping[str, Any]) -> dict[str, Any]:
+    def replace_id(match):
+        matched_id = match.group(0)
+        return id_map.get(matched_id, matched_id)
+
+    dict_json = re.sub(r'[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}', replace_id, json.dumps(item_data))
+
+    return json.loads(dict_json)
+
+
+def update_crypts(crypt_map: Mapping[str, str], item_data: Mapping[str, Any]) -> dict[str, Any]:
+    def replace_crypt(match):
+        matched_crypt = match.group(0)
+        return crypt_map.get(matched_crypt, matched_crypt)
+
+    dict_json = re.sub(r'\$CRYPT_CLUSTER\$.+?(?=["\s\\])', replace_crypt, json.dumps(item_data))
+
+    return json.loads(dict_json)
+
+
+class ExtendedTemplate:
+    template_pattern = re.compile(r'{name(?:\s+(?P<regex>[^}]*))?}')
+
+    def __init__(self, name_regex: str):
+        self.src_template = name_regex
+        self.label_value_map = None
+
+    def __call__(self, name: str) -> str:
+        """
+        Raise ValueError when issues are encountered while processing the name_regex
+        @param name: Current item name
+        @return: New name from item name using the name_regex
+        """
+
+        def regex_replace(match_obj):
+            regex = match_obj.group('regex')
+            if regex is not None:
+                try:
+                    regex_p = re.compile(regex)
+                except re.error:
+                    raise ValueError('regular expression is invalid') from None
+                if not regex_p.groups:
+                    raise ValueError('regular expression must include at least one capturing group')
+
+                value, regex_p_subs = regex_p.subn(''.join(f'\\{group + 1}' for group in range(regex_p.groups)), name)
+                new_value = value if regex_p_subs else ''
+            else:
+                new_value = name
+
+            label = 'name_{count}'.format(count=len(self.label_value_map))
+            self.label_value_map[label] = new_value
+
+            return f'{{{label}}}'
+
+        self.label_value_map = {}
+        template, name_p_subs = self.template_pattern.subn(regex_replace, self.src_template)
+        if not name_p_subs:
+            raise ValueError('name-regex must include {name} variable')
+
+        try:
+            result_name = template.format(**self.label_value_map)
+        except (KeyError, IndexError):
+            raise ValueError('invalid name-regex') from None
+
+        return result_name
+
+
+def default_getter(*fields: str, default: Any = None) -> Callable[[Mapping[str, Any]], Any]:
+    if len(fields) == 1:
+        def getter_fn(obj):
+            return obj.get(fields[0], default)
+    else:
+        def getter_fn(obj):
+            return tuple(obj.get(field, default) for field in fields)
+
+    return getter_fn
+
+
+class ModelException(Exception):
+    """ Exception for REST API model errors """
+    pass

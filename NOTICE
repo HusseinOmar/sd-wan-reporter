@@ -1,0 +1,22 @@
+THIRD-PARTY SOFTWARE NOTICES AND ATTRIBUTIONS
+=============================================
+
+This project bundles and builds upon third-party software. The respective
+license and copyright notice are reproduced in the referenced files.
+
+-------------------------------------------------------------------------------
+1. SD-WAN configuration backup engine  (the "cisco_sdwan" package)
+-------------------------------------------------------------------------------
+Location in this repository: tools/cisco_sdwan/
+Copyright (c) 2019-2026 Cisco Systems, Inc. and/or its affiliates
+License:                     MIT License (see tools/THIRD_PARTY_LICENSE)
+
+This package is used by Stage 2 to perform the configuration backup. The
+package source is included unmodified.
+
+-------------------------------------------------------------------------------
+Python package dependencies
+-------------------------------------------------------------------------------
+This project depends on, but does not redistribute, the packages listed in
+requirements.txt (requests, aiohttp, tqdm, pwinput, ratelimit, PyYAML,
+pydantic, urllib3, Flask), each distributed under its own license.

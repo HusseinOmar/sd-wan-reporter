@@ -1,0 +1,17 @@
+# Combined SD-WAN collector (RADIN + Sastre backup) + web app
+# Python 3.10 - 3.12 recommended.
+
+# --- RADIN collection ---
+requests==2.32.3
+tqdm==4.66.5
+aiohttp==3.10.8
+pwinput==1.0.3
+ratelimit==2.2.1
+
+# --- Sastre (cisco_sdwan) backup task ---
+PyYAML==6.0.3
+pydantic==2.13.4
+urllib3==2.7.0
+
+# --- Web app ---
+Flask==3.0.3

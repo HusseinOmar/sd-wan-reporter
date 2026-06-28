@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime output and logs
+runs/
+logs/
+*.log
+script_log.log
+
+# Stage 1 collection output (random-named working dirs + zip, written under tools/)
+tools/[0-9]*/
+tools/[0-9]*.zip
+*.zip
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

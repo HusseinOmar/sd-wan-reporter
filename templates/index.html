@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Catalyst SD-WAN Reporter</title>
+  <style>
+    :root { --bg:#0f172a; --card:#1e293b; --fg:#e2e8f0; --muted:#94a3b8;
+            --accent:#38bdf8; --ok:#22c55e; --err:#ef4444; --border:#334155; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+           background:var(--bg); color:var(--fg); }
+    .wrap { max-width: 760px; margin: 40px auto; padding: 0 16px; }
+    h1 { text-align:center; font-size: 40px; font-weight: 700; margin: 8px 0 24px;
+         letter-spacing: -0.5px; }
+    .privacy { margin-top:16px; padding:16px 18px; border-radius:10px;
+               border:1px solid var(--accent); background:rgba(56,189,248,.08);
+               color:var(--fg); font-size:15px; line-height:1.6; }
+    .privacy strong { color:var(--accent); }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:12px;
+            padding:24px; margin-top:20px; }
+    label { display:block; font-size:13px; color:var(--muted); margin:12px 0 4px; }
+    input { width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--border);
+            background:#0b1220; color:var(--fg); font-size:14px; }
+    .row { display:flex; gap:12px; }
+    .row > div { flex:1; }
+    button { margin-top:20px; width:100%; padding:12px; border:0; border-radius:8px;
+             background:var(--accent); color:#06283d; font-weight:600; font-size:15px;
+             cursor:pointer; display:inline-flex; align-items:center; justify-content:center;
+             gap:10px; }
+    button:disabled { opacity:.75; cursor:not-allowed; }
+    .spinner { width:16px; height:16px; border:2.5px solid rgba(6,40,61,.35);
+               border-top-color:#06283d; border-radius:50%; animation:spin .7s linear infinite;
+               display:none; }
+    button.loading .spinner { display:inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .log { margin-top:20px; background:#0b1220; border:1px solid var(--border);
+           border-radius:8px; padding:12px; height:240px; overflow:auto;
+           font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12.5px;
+           white-space:pre-wrap; }
+    .status { margin-top:14px; font-size:14px; min-height:18px; }
+    .status.ok { color:var(--ok); }
+    .status.err { color:var(--err); }
+    #status2 { margin-top:6px; color:var(--muted); }
+    #status2.ok { color:var(--ok); }
+    #status2.err { color:var(--err); }
+    .logHeader { margin-top:18px; font-size:13px; color:var(--muted); }
+    .notice { margin-top:16px; padding:14px 16px; border-radius:8px;
+              border:1px solid var(--ok); background:rgba(34,197,94,.08);
+              color:var(--fg); font-size:14px; line-height:1.5; }
+    .notice code { color:var(--accent); word-break:break-all; }
+    .errbox { margin-top:16px; padding:14px 16px; border-radius:8px;
+              border:1px solid var(--err); background:rgba(239,68,68,.08);
+              color:var(--fg); font-size:13.5px; line-height:1.5; white-space:pre-wrap;
+              font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    a.dl { display:inline-block; margin-top:14px; color:var(--accent); font-weight:600; }
+    .connbox { display:flex; align-items:center; gap:14px; padding:14px 16px;
+               border:1px solid var(--ok); border-radius:10px;
+               background:rgba(34,197,94,.08); }
+    .connbox .dot { width:12px; height:12px; border-radius:50%; background:var(--ok);
+                    box-shadow:0 0 0 0 rgba(34,197,94,.6); animation:pulse 1.8s infinite; flex:none; }
+    @keyframes pulse {
+      0% { box-shadow:0 0 0 0 rgba(34,197,94,.55); }
+      70% { box-shadow:0 0 0 8px rgba(34,197,94,0); }
+      100% { box-shadow:0 0 0 0 rgba(34,197,94,0); }
+    }
+    .conntitle { font-weight:700; color:var(--ok); font-size:15px; }
+    .connmeta { color:var(--fg); font-size:13.5px; margin-top:2px; }
+    .connmeta .sep { color:var(--muted); margin:0 4px; }
+
+    /* Progress bar */
+    .progress { margin-top:20px; display:none; }
+    .progress .plabel { display:flex; justify-content:space-between; font-size:13px;
+                        color:var(--muted); margin-bottom:6px; }
+    .progress .ptrack { height:14px; border-radius:8px; background:#0b1220;
+                        border:1px solid var(--border); overflow:hidden; }
+    .progress .pfill { height:100%; width:0%; border-radius:8px 0 0 8px;
+                       background-image:linear-gradient(90deg, #0ea5e9, #38bdf8);
+                       background-size:200% 100%;
+                       transition:width .6s cubic-bezier(.22,.61,.36,1);
+                       position:relative; }
+    .progress .pfill::after {
+      content:""; position:absolute; inset:0;
+      background-image:linear-gradient(45deg, rgba(255,255,255,.18) 25%, transparent 25%,
+        transparent 50%, rgba(255,255,255,.18) 50%, rgba(255,255,255,.18) 75%,
+        transparent 75%, transparent);
+      background-size:26px 26px; animation:stripes 0.9s linear infinite;
+    }
+    .progress.done .pfill { background-image:linear-gradient(90deg, #16a34a, #22c55e); }
+    .progress.done .pfill::after { animation:none; opacity:.0; }
+    @keyframes stripes { from { background-position:0 0; } to { background-position:26px 0; } }
+
+    /* View entrance animations */
+    @keyframes fadeUp { from { opacity:0; transform:translateY(10px); }
+                        to { opacity:1; transform:translateY(0); } }
+    h1, .privacy, .card { animation:fadeUp .5s ease both; }
+    .privacy { animation-delay:.05s; }
+    .card { animation-delay:.1s; }
+    #connbox, #notice, .progress, #errbox { animation:fadeUp .35s ease both; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Catalyst SD-WAN Reporter</h1>
+
+    <div class="privacy">
+      <strong>Your privacy is protected.</strong>
+      This tool does not collect any passwords, secrets, or sensitive details about your
+      network. It gathers only high-level operational information about the features and
+      configuration adopted in your environment. The credentials you enter are used solely
+      to authenticate to your SD-WAN Manager for this session and are never stored.
+    </div>
+
+    <div class="card">
+      <div id="connbox" class="connbox" style="display:none">
+        <span class="dot"></span>
+        <div class="conninfo">
+          <div class="conntitle">Connected</div>
+          <div class="connmeta">
+            <span id="connHost">—</span>
+            <span class="sep">&middot;</span>
+            <span>Version <span id="connVer">—</span></span>
+            <span class="sep">&middot;</span>
+            <span id="connAddr">—</span>
+          </div>
+        </div>
+      </div>
+
+      <form id="form">
+        <div class="row">
+          <div style="flex:2">
+            <label>Manager IP address</label>
+            <input id="address" placeholder="10.0.0.1" autocomplete="off" required />
+          </div>
+          <div>
+            <label>Port</label>
+            <input id="port" placeholder="443" value="443" autocomplete="off" />
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label>Username</label>
+            <input id="user" autocomplete="off" required />
+          </div>
+          <div>
+            <label>Password</label>
+            <input id="password" type="password" autocomplete="off" required />
+          </div>
+        </div>
+        <button id="runBtn" type="submit">
+          <span class="spinner"></span>
+          <span id="btnLabel">Run collection</span>
+        </button>
+      </form>
+
+      <div id="status1" class="status"></div>
+      <div id="status2" class="status"></div>
+      <div id="errbox" class="errbox" style="display:none"></div>
+
+      <div id="progress" class="progress">
+        <div class="plabel">
+          <span id="progLabel">API endpoints used: 0 / ~0</span>
+          <span id="progPct">0%</span>
+        </div>
+        <div class="ptrack"><div id="progFill" class="pfill"></div></div>
+      </div>
+
+      <div id="notice" class="notice" style="display:none"></div>
+      <div id="logHeader" class="logHeader" style="display:none">Recent API endpoints (<span id="epCount">0</span> unique)</div>
+      <div id="logBox" class="log" style="display:none"></div>
+      <div id="downloadBox"></div>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('form');
+    const connbox = document.getElementById('connbox');
+    const connHost = document.getElementById('connHost');
+    const connVer = document.getElementById('connVer');
+    const connAddr = document.getElementById('connAddr');
+    const runBtn = document.getElementById('runBtn');
+    const btnLabel = document.getElementById('btnLabel');
+    const status1 = document.getElementById('status1');
+    const status2 = document.getElementById('status2');
+    const errbox = document.getElementById('errbox');
+    const noticeEl = document.getElementById('notice');
+    const logHeader = document.getElementById('logHeader');
+    const epCount = document.getElementById('epCount');
+    const progress = document.getElementById('progress');
+    const progFill = document.getElementById('progFill');
+    const progLabel = document.getElementById('progLabel');
+    const progPct = document.getElementById('progPct');
+    const logBox = document.getElementById('logBox');
+    const downloadBox = document.getElementById('downloadBox');
+    let poll = null;
+
+    function setButton(label, loading) {
+      runBtn.disabled = loading;
+      runBtn.classList.toggle('loading', loading);
+      btnLabel.textContent = label;
+    }
+
+    function setStatus(el, text, level) {
+      el.className = 'status' + (level && level !== 'info' ? ' ' + level : '');
+      el.textContent = text || '';
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      // Immediate feedback on click.
+      setButton('Checking manager reachability', true);
+      setStatus(status1, 'Checking manager reachability...', 'info');
+      setStatus(status2, '', 'info');
+      connbox.style.display = 'none';
+      errbox.style.display = 'none';
+      errbox.textContent = '';
+      progress.style.display = 'none';
+      progress.classList.remove('done');
+      progFill.style.width = '0%';
+      noticeEl.style.display = 'none';
+      noticeEl.innerHTML = '';
+      downloadBox.innerHTML = '';
+      logHeader.style.display = 'none';
+      logBox.style.display = 'none';
+      logBox.textContent = '';
+
+      const payload = {
+        address: document.getElementById('address').value,
+        port: document.getElementById('port').value,
+        user: document.getElementById('user').value,
+        password: document.getElementById('password').value,
+      };
+
+      try {
+        const res = await fetch('/api/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Request failed');
+        watch(data.job_id);
+      } catch (err) {
+        setStatus(status1, 'Error: ' + err.message, 'err');
+        setButton('Run collection', false);
+      }
+    });
+
+    function watch(jobId) {
+      if (poll) clearInterval(poll);
+      poll = setInterval(async () => {
+        const res = await fetch('/api/status/' + jobId);
+        const data = await res.json();
+
+        // Phase-driven status lines + button text from the backend.
+        if (data.status1 !== undefined && data.status1 !== '') {
+          setStatus(status1, data.status1, data.level1);
+        }
+        if (data.status2 !== undefined && data.status2 !== '') {
+          setStatus(status2, data.status2, data.level2);
+        }
+        if (data.button && data.status === 'running') {
+          setButton(data.button, true);
+        }
+
+        // Once authenticated: collapse the form and show the connected panel.
+        if (data.connected) {
+          connHost.textContent = data.hostname || 'SD-WAN Manager';
+          connVer.textContent = data.version || 'unknown';
+          connAddr.textContent = data.address || '';
+          connbox.style.display = 'flex';
+          form.style.display = 'none';
+        }
+
+        // API endpoints log window (unchanged behaviour).
+        const eps = data.endpoints || [];
+        if (eps.length) {
+          logHeader.style.display = 'block';
+          logBox.style.display = 'block';
+          epCount.textContent = data.endpoint_count || eps.length;
+          const atBottom = logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 40;
+          logBox.textContent = eps.join('\n');
+          if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+        }
+
+        // Progress bar: used / ~total API calls.
+        const calls = data.calls || 0;
+        const total = data.total || 0;
+        if (calls > 0 || total > 0) {
+          progress.style.display = 'block';
+          let pct;
+          if (total > 0) {
+            pct = Math.min(99, Math.round((calls / total) * 100));
+            progLabel.textContent = 'API endpoints used: ' + calls + ' / ~' + total;
+          } else {
+            pct = 0;
+            progLabel.textContent = 'API endpoints used: ' + calls + ' (estimating total...)';
+          }
+          progFill.style.width = pct + '%';
+          progPct.textContent = pct + '%';
+        }
+
+        if (data.status === 'done') {
+          clearInterval(poll);
+          setStatus(status2, data.status2 || 'Collection complete', 'ok');
+          setButton('Run collection', false);
+          progress.style.display = 'block';
+          progress.classList.add('done');
+          progFill.style.width = '100%';
+          progPct.textContent = '100%';
+          if ((data.total || 0) > 0) {
+            progLabel.textContent = 'API endpoints used: ' + (data.calls || 0) + ' / ~' + data.total;
+          }
+          noticeEl.style.display = 'block';
+          noticeEl.innerHTML =
+            '<strong>Output saved locally:</strong><br><code>' +
+            (data.saved_path || data.filename || '') + '</code><br><br>' +
+            'Please share this output file with the <strong>Cisco team</strong>.';
+          downloadBox.innerHTML =
+            '<a class="dl" href="' + data.download + '">Download ' +
+            (data.filename || 'combined.zip') + '</a>';
+        } else if (data.status === 'error') {
+          clearInterval(poll);
+          setButton('Run collection', false);
+          // Show the full log together with the error details.
+          const full = (data.log || []).join('\n') +
+                       (data.error ? '\n\n' + data.error : '');
+          errbox.style.display = 'block';
+          errbox.textContent = full;
+        }
+      }, 1000);
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,2935 @@
+"""
+ Sastre - Cisco-SDWAN Automation Toolset
+
+ cisco_sdwan.base.models_vmanage
+ This module implements SD-WAN Manager API models
+"""
+import re
+from typing import Optional, Any
+from enum import Enum
+from collections.abc import Mapping, Sequence, Callable, Iterable, Iterator
+from pathlib import Path
+from collections import namedtuple
+from copy import deepcopy
+from urllib.parse import quote_plus
+from pydantic import Field
+from .rest_api import Rest, RestAPIException
+from .catalog import register, op_register
+from .models_base import (ApiItem, IndexApiItem, ConfigItem, Config2Item, IndexConfigItem, RecordItem, RealtimeItem,
+                          BulkStatsItem, BulkStateItem, ApiPath, PathKey, CliOrFeatureApiPath, ApiPathGroup, IdName,
+                          entry_time_parse, ConfigRequestModel, FeatureProfile, FeatureProfileIndex, AdminSettingsItem)
+
+
+#
+# Non-config items
+#
+class DeviceModeCli(ApiItem):
+    api_path = ApiPath(None, 'template/config/device/mode/cli', None, None)
+    id_tag = 'id'
+
+    @staticmethod
+    def api_params(device_type, *device_ids):
+        return {
+            "deviceType": device_type,
+            "devices": [{"deviceId": device_id} for device_id in device_ids]
+        }
+
+
+class EncryptText(ApiItem):
+    api_path = ApiPath(None, 'template/security/encryptText/encrypt', None, None)
+    id_tag = 'id'
+
+    @staticmethod
+    def api_params(input_string):
+        return {
+            "inputString": input_string
+        }
+
+    @property
+    def encrypted_value(self):
+        return self.data.get('encryptedText', None)
+
+
+class DeviceTemplateAttach(ApiItem):
+    api_path = ApiPath(None, 'template/device/config/attachfeature', None, None)
+    id_tag = 'id'
+
+    @staticmethod
+    def api_params(template_input_iter, is_edited):
+        """
+        Build dictionary used to provide input parameters for api POST call
+        @param template_input_iter: An iterable of (<template_id>, <input_list>) tuples. Input_list is a list where
+                                    each entry represents one attached device and is a dictionary of input
+                                    variable names and values.
+        @param is_edited: True if this is an in-place re-attach, False if this is a template attach.
+        @return: Dictionary used to provide POST input parameters
+        """
+
+        def template_entry(template_id, template_input_list):
+            return {
+                "templateId": template_id,
+                "device": template_input_list,
+                "isEdited": is_edited,
+                "isMasterEdited": False,
+            }
+
+        return {
+            "deviceTemplateList": [
+                template_entry(item_id, input_list) for item_id, input_list in template_input_iter
+            ]
+        }
+
+
+class TagAssociate(ApiItem):
+    api_path = ApiPath(None, 'v1/tags/associate', None, None)
+    id_tag = 'taskId'
+
+    @staticmethod
+    def device_api_params(tag_mappings: Iterable[tuple[str, Iterable[str]]]) -> dict[str, Any]:
+        """
+        Build dictionary used to provide input parameters for api POST call
+        @param tag_mappings: An iterable of (<tag_id>, <device_id_list>) tuples. <device_id_list> is a list of device
+                             ids to be associated with this tag.
+        @return: Dictionary used to provide POST input parameters
+        """
+        def tag_entry(tag_id, device_id_list):
+            return {
+                "tagId": tag_id,
+                "objects": [
+                    {"id": device_id, "objectType": "DEVICE"} for device_id in device_id_list
+                ]
+            }
+
+        return {
+            "data": [
+                tag_entry(tag_id, device_id_list) for tag_id, device_id_list in tag_mappings
+            ]
+        }
+
+
+class TagDissociate(TagAssociate):
+    api_path = ApiPath(None, 'v1/tags/associate?operationType=DELETE', None, None)
+
+
+class RuleAssociate(ApiItem):
+    api_path = ApiPath(None, 'v1/rules/{ruleId}/associate', None, 'v1/rules/{ruleId}/associate')
+    id_tag = 'taskId'
+
+    @staticmethod
+    def cfg_group_api_params(config_group_ids: Iterable[str]) -> dict[str, Any]:
+        """
+        Build dictionary used to provide input parameters for api POST call
+        @param config_group_ids: An iterable of <config_group_id>.
+        @return: Dictionary used to provide POST input parameters
+        """
+        def rule_entry(config_group_id):
+            return {
+                "id": config_group_id,
+                "objectType": "CONFIG_GROUP"
+            }
+
+        return {
+            "data": [
+                rule_entry(config_group_id) for config_group_id in config_group_ids
+            ]
+        }
+
+    @staticmethod
+    def cfg_group_delete_params(config_group_id: str) -> dict[str, str]:
+        """
+        Build dictionary used to provide url parameters for api DELETE call
+        @param config_group_id: Config-group ID string
+        @return: Dictionary used to provide DELETE url parameters
+        """
+        return {
+            "objectId": config_group_id,
+            "objectType": "CONFIG_GROUP"
+        }
+
+
+class DeviceTemplateCLIAttach(DeviceTemplateAttach):
+    api_path = ApiPath(None, 'template/device/config/attachcli', None, None)
+
+
+class PolicyVsmartDeactivate(ApiItem):
+    api_path = ApiPath(None, 'template/policy/vsmart/deactivate', None, None)
+    id_tag = 'id'
+
+
+class PolicyVsmartActivate(ApiItem):
+    api_path = ApiPath(None, 'template/policy/vsmart/activate', None, None)
+    id_tag = 'id'
+
+    @staticmethod
+    def api_params(is_edited):
+        return {"isEdited": True} if is_edited else {}
+
+
+class PolicyVsmartStatus(ApiItem):
+    api_path = ApiPath('template/policy/vsmart/connectivity/status', None, None, None)
+
+    def raise_for_status(self):
+        def vsmart_ready(vsmart_entry):
+            return vsmart_entry['operationMode'] == 'vmanage'
+
+        data_list = self.data.get('data', [])
+        if len(data_list) == 0 or not all(vsmart_ready(entry) for entry in data_list):
+            raise PolicyVsmartStatusException()
+
+
+class PolicyVsmartStatusException(Exception):
+    """ Exception indicating SD-WAN Controller (vSmart) status is not ready """
+    pass
+
+
+class EdgeCertificateSync(ApiItem):
+    api_path = ApiPath(None, 'certificate/vedge/list?action=push', None, None)
+    id_tag = 'id'
+
+
+class ActionStatus(ApiItem):
+    api_path = ApiPath('device/action/status', None, None, None)
+
+    @property
+    def status(self):
+        return self.data.get('summary', {}).get('status', None)
+
+    @property
+    def is_completed(self):
+        return self.status == 'done'
+
+    @property
+    def is_successful(self):
+        def task_success(task_entry):
+            return task_entry['statusId'] == 'success' or task_entry['statusId'] == 'success_scheduled'
+
+        data_list = self.data.get('data', [])
+        # When action validation fails, returned data is empty
+        if len(data_list) == 0:
+            return False
+
+        return all(task_success(entry) for entry in data_list)
+
+    @property
+    def activity_details(self):
+        def device_details(task_entry):
+            return f"{task_entry.get('host-name', '<unknown>')}: {', '.join(task_entry.get('activity', []))}"
+
+        data_list = self.data.get('data', [])
+        # When action validation fails, returned data is empty
+        if len(data_list) == 0:
+            validation_details = self.data.get('validation', {}).get('activity', [])
+            return ', '.join(validation_details) or 'No further details provided in received action status'
+
+        return ', '.join(device_details(entry) for entry in data_list)
+
+
+class CheckVBond(ApiItem):
+    api_path = ApiPath('template/device/config/vbond', None, None, None)
+
+    @property
+    def is_configured(self):
+        return self.data.get('isVbondConfigured', False)
+
+
+class DeviceBootstrap(ApiItem):
+    api_path = ApiPath('system/device/bootstrap/device/{uuid}', None, None, None)
+
+    @property
+    def uuid(self) -> str:
+        return self.parse(r'- uuid : ([^$]+?)$')
+
+    @property
+    def otp(self) -> str:
+        return self.parse(r'- otp : ([^$]+?)$')
+
+    @property
+    def vbond(self) -> str:
+        """SD-WAN Validator address from bootstrap config"""
+        return self.parse(r'- vbond : ([^$]+?)$')
+
+    @property
+    def organization(self) -> str:
+        return self.parse(r'- org : ([^$]+?)$')
+
+    def parse(self, regex: str) -> str:
+        match = re.search(regex, self.data.get('bootstrapConfig', ''), re.MULTILINE)
+        if not match:
+            raise RestAPIException("Unexpected 'bootstrapConfig' format")
+
+        return match.group(1)
+
+    @property
+    def bootstrap_config(self) -> str:
+        config = self.data.get('bootstrapConfig')
+        if config is None:
+            raise RestAPIException("Missing 'bootstrapConfig'")
+
+        return config
+
+    @classmethod
+    def get(cls, api: Rest, *, uuid: Optional[str] = None,
+            config_type: str = 'cloudinit', include_default_root_certs: bool = True, version: str = 'v1'):
+
+        if uuid is None:
+            raise ValueError("Parameter 'uuid' is required")
+
+        return super().get(
+            api, uuid=uuid, configtype=config_type, inclDefRootCert=include_default_root_certs, version=version
+        )
+
+
+#
+# Device Inventory
+#
+class Device(IndexApiItem):
+    api_path = ApiPath('device', None, None, None)
+    iter_fields = ('uuid', 'host-name')
+
+    extended_iter_fields = ('deviceId', 'site-id', 'reachability', 'device-type', 'device-model')
+
+
+class Inventory(IndexApiItem):
+    """
+    Parent class for the inventory-type classes EdgeInventory and ControlInventory.
+    Not supposed to be used directly, use the corresponding child classes instead.
+    """
+    FilterEntry = namedtuple(
+        'FilterEntry', ['uuid', 'cert_state', 'name', 'system_ip', 'model', 'type', 'template', 'config_group']
+    )
+
+    @staticmethod
+    def is_cedge(device_entry: FilterEntry) -> bool:
+        """
+        Filtered_iter filter selecting CEDGE devices
+        """
+        return device_entry.model is not None and device_entry.model in CEDGE_SET
+
+    @staticmethod
+    def is_vedge(device_entry: FilterEntry) -> bool:
+        """
+        Filtered_iter filter selecting VEDGE devices
+        """
+        is_controller = device_entry.type is not None and device_entry.type in {'vsmart', 'vbond', 'vmanage'}
+
+        return not is_controller and not Inventory.is_cedge(device_entry)
+
+    @staticmethod
+    def is_vsmart(device_entry: FilterEntry) -> bool:
+        """Filtered_iter filter selecting SD-WAN Controller devices (vsmart)"""
+        return device_entry.type is not None and device_entry.type == 'vsmart'
+
+    @staticmethod
+    def is_vbond(device_entry: FilterEntry) -> bool:
+        """Filtered_iter filter selecting SD-WAN Validator devices (vbond)"""
+        return device_entry.type is not None and device_entry.type == 'vbond'
+
+    @staticmethod
+    def is_vmanage(device_entry: FilterEntry) -> bool:
+        """Filtered_iter filter selecting SD-WAN Manager devices (vmanage)"""
+        return device_entry.type is not None and device_entry.type == 'vmanage'
+
+    @staticmethod
+    def is_available(device_entry: FilterEntry) -> bool:
+        """
+        Filtered_iter filter selecting devices available, that is, not yet attached to a template or config-group
+        """
+        return not device_entry.template and not device_entry.config_group
+
+    @staticmethod
+    def is_attached(device_entry: FilterEntry) -> bool:
+        """
+        Filtered_iter filter selecting devices currently attached to a template
+        """
+        return device_entry.template is not None and len(device_entry.template) > 0
+
+    @staticmethod
+    def is_associated(device_entry: FilterEntry) -> bool:
+        """
+        Filtered_iter filter selecting devices currently associated with a config-group
+        """
+        return device_entry.config_group is not None and len(device_entry.config_group) > 0
+
+    def filtered_iter(self, *filter_fns: Callable) -> Iterable[FilterEntry]:
+        # If no filter_fns is provided, no filtering is done and iterate over all entries
+        return (
+            entry for entry
+            in map(Inventory.FilterEntry._make, self.iter(*self.iter_fields, *self.extended_iter_fields,
+                                                          'deviceModel', 'deviceType', 'template', 'name'))
+            if all(filter_fn(entry) for filter_fn in filter_fns)
+        )
+
+
+class EdgeInventory(Inventory):
+    api_path = ApiPath('system/device/vedges', None, None, None)
+    iter_fields = ('uuid', 'vedgeCertificateState')
+    extended_iter_fields = ('host-name', 'system-ip')
+
+    @staticmethod
+    def is_cert_installed(device_entry: Inventory.FilterEntry) -> bool:
+        """
+        Filtered_iter filter selecting devices with certificate installed
+        """
+        return device_entry.cert_state is not None and device_entry.cert_state == 'certinstalled'
+
+
+class ControlInventory(Inventory):
+    api_path = ApiPath('system/device/controllers', None, None, None)
+    iter_fields = ('uuid', 'validity')
+    extended_iter_fields = ('host-name', 'system-ip')
+
+    @staticmethod
+    def is_cert_valid(device_entry: Inventory.FilterEntry) -> bool:
+        """
+        Filtered_iter filter selecting devices with certificate installed
+        """
+        return device_entry.cert_state is not None and device_entry.cert_state == 'valid'
+
+
+#
+# Device configuration
+#
+class DeviceConfig(ConfigItem):
+    api_path = ApiPath('template/config/attached', None, None, None)
+    store_path = ('device_configs',)
+    store_file = '{item_name}.txt'
+
+    def save(self, node_dir, ext_name=False, item_name=None, item_id=None):
+        """
+        Save data (i.e. self.data) to a JSON file
+
+        @param node_dir: String indicating directory under root_dir used for all files from a given vManage node.
+        @param ext_name: True indicates that item_names need to be extended (with item_id) to make their filename
+                         safe version unique. False otherwise.
+        @param item_name: (Optional) Name of the item being saved. Variable used to build the filename.
+        @param item_id: (Optional) UUID for the item being saved. Variable used to build the filename.
+        @return: True indicates data has been saved. False indicates no data to save (and no file has been created).
+        """
+        if self.is_empty:
+            return False
+
+        dir_path = Path(self.root_dir, node_dir, *self.store_path)
+        dir_path.mkdir(parents=True, exist_ok=True)
+
+        with open(dir_path.joinpath(self.get_filename(ext_name, item_name, item_id)), 'w') as write_f:
+            write_f.write(self.data['config'])
+
+        return True
+
+    @staticmethod
+    def api_params(device_id):
+        # Device uuid is not url-safe
+        return quote_plus(device_id)
+
+
+class DeviceConfigRFS(DeviceConfig):
+    store_file = '{item_name}_rfs.txt'
+
+    @staticmethod
+    def api_params(device_id):
+        # Device uuid is not url-safe
+        return '{safe_device_id}?type=RFS'.format(safe_device_id=quote_plus(device_id))
+
+
+# Set of device types that use cedge template class. Updated as of SD-WAN Manager 20.15
+CEDGE_SET = {
+    "cellular-gateway-CG113-4GW6A", "cellular-gateway-CG113-4GW6B", "cellular-gateway-CG113-4GW6E",
+    "cellular-gateway-CG113-4GW6H", "cellular-gateway-CG113-4GW6Q", "cellular-gateway-CG113-4GW6Z",
+    "cellular-gateway-CG113-W6A", "cellular-gateway-CG113-W6B", "cellular-gateway-CG113-W6E",
+    "cellular-gateway-CG113-W6H", "cellular-gateway-CG113-W6Q", "cellular-gateway-CG113-W6Z",
+    "cellular-gateway-CG418-E", "cellular-gateway-CG522-E", "vedge-ASR-1001-HX", "vedge-ASR-1001-HX-SD-ROUTING",
+    "vedge-ASR-1001-X", "vedge-ASR-1002-HX", "vedge-ASR-1002-HX-SD-ROUTING", "vedge-ASR-1002-X", "vedge-ASR-1006-X",
+    "vedge-C1101-4P", "vedge-C1101-4P-SD-ROUTING", "vedge-C1101-4PLTEP", "vedge-C1101-4PLTEP-SD-ROUTING",
+    "vedge-C1101-4PLTEPW", "vedge-C1101-4PLTEPW-SD-ROUTING", "vedge-C1109-2PLTEGB", "vedge-C1109-2PLTEGB-SD-ROUTING",
+    "vedge-C1109-2PLTEUS", "vedge-C1109-2PLTEUS-SD-ROUTING", "vedge-C1109-2PLTEVZ", "vedge-C1109-2PLTEVZ-SD-ROUTING",
+    "vedge-C1109-4PLTE2P", "vedge-C1109-4PLTE2P-SD-ROUTING", "vedge-C1109-4PLTE2PW", "vedge-C1109-4PLTE2PW-SD-ROUTING",
+    "vedge-C1111-4P", "vedge-C1111-4P-SD-ROUTING", "vedge-C1111-4PLTEEA", "vedge-C1111-4PLTEEA-SD-ROUTING",
+    "vedge-C1111-4PLTELA", "vedge-C1111-4PLTELA-SD-ROUTING", "vedge-C1111-4PW", "vedge-C1111-4PW-SD-ROUTING",
+    "vedge-C1111-8P", "vedge-C1111-8P-SD-ROUTING", "vedge-C1111-8PLTEEA", "vedge-C1111-8PLTEEA-SD-ROUTING",
+    "vedge-C1111-8PLTEEAW", "vedge-C1111-8PLTEEAW-SD-ROUTING", "vedge-C1111-8PLTELA", "vedge-C1111-8PLTELA-SD-ROUTING",
+    "vedge-C1111-8PLTELAW", "vedge-C1111-8PLTELAW-SD-ROUTING", "vedge-C1111-8PW", "vedge-C1111-8PW-SD-ROUTING",
+    "vedge-C1111X-8P", "vedge-C1111X-8P-SD-ROUTING", "vedge-C1112-8P", "vedge-C1112-8P-SD-ROUTING",
+    "vedge-C1112-8PLTEEA", "vedge-C1112-8PLTEEA-SD-ROUTING", "vedge-C1112-8PLTEEAWE",
+    "vedge-C1112-8PLTEEAWE-SD-ROUTING", "vedge-C1112-8PWE", "vedge-C1112-8PWE-SD-ROUTING", "vedge-C1113-8P",
+    "vedge-C1113-8P-SD-ROUTING", "vedge-C1113-8PLTEEA", "vedge-C1113-8PLTEEA-SD-ROUTING", "vedge-C1113-8PLTEEAW",
+    "vedge-C1113-8PLTEEAW-SD-ROUTING", "vedge-C1113-8PLTELA", "vedge-C1113-8PLTELA-SD-ROUTING", "vedge-C1113-8PLTELAWZ",
+    "vedge-C1113-8PLTELAWZ-SD-ROUTING", "vedge-C1113-8PLTEW", "vedge-C1113-8PLTEW-SD-ROUTING", "vedge-C1113-8PM",
+    "vedge-C1113-8PM-SD-ROUTING", "vedge-C1113-8PMLTEEA", "vedge-C1113-8PMLTEEA-SD-ROUTING", "vedge-C1113-8PMWE",
+    "vedge-C1113-8PMWE-SD-ROUTING", "vedge-C1113-8PW", "vedge-C1113-8PW-SD-ROUTING", "vedge-C1116-4P",
+    "vedge-C1116-4P-SD-ROUTING", "vedge-C1116-4PLTEEA", "vedge-C1116-4PLTEEA-SD-ROUTING", "vedge-C1116-4PLTEEAWE",
+    "vedge-C1116-4PLTEEAWE-SD-ROUTING", "vedge-C1116-4PWE", "vedge-C1116-4PWE-SD-ROUTING", "vedge-C1117-4P",
+    "vedge-C1117-4P-SD-ROUTING", "vedge-C1117-4PLTEEA", "vedge-C1117-4PLTEEA-SD-ROUTING", "vedge-C1117-4PLTEEAW",
+    "vedge-C1117-4PLTEEAW-SD-ROUTING", "vedge-C1117-4PLTELA", "vedge-C1117-4PLTELA-SD-ROUTING", "vedge-C1117-4PLTELAWZ",
+    "vedge-C1117-4PLTELAWZ-SD-ROUTING", "vedge-C1117-4PM", "vedge-C1117-4PM-SD-ROUTING", "vedge-C1117-4PMLTEEA",
+    "vedge-C1117-4PMLTEEA-SD-ROUTING", "vedge-C1117-4PMLTEEAWE", "vedge-C1117-4PMLTEEAWE-SD-ROUTING",
+    "vedge-C1117-4PMWE", "vedge-C1117-4PMWE-SD-ROUTING", "vedge-C1117-4PW", "vedge-C1117-4PW-SD-ROUTING",
+    "vedge-C1118-8P", "vedge-C1118-8P-SD-ROUTING", "vedge-C1121-4P", "vedge-C1121-4P-SD-ROUTING", "vedge-C1121-4PLTEP",
+    "vedge-C1121-4PLTEP-SD-ROUTING", "vedge-C1121-8P", "vedge-C1121-8P-SD-ROUTING", "vedge-C1121-8PLTEP",
+    "vedge-C1121-8PLTEP-SD-ROUTING", "vedge-C1121-8PLTEPW", "vedge-C1121-8PLTEPW-SD-ROUTING", "vedge-C1121X-8P",
+    "vedge-C1121X-8P-SD-ROUTING", "vedge-C1121X-8PLTEP", "vedge-C1121X-8PLTEP-SD-ROUTING", "vedge-C1121X-8PLTEPW",
+    "vedge-C1121X-8PLTEPW-SD-ROUTING", "vedge-C1126-8PLTEP", "vedge-C1126-8PLTEP-SD-ROUTING", "vedge-C1126X-8PLTEP",
+    "vedge-C1126X-8PLTEP-SD-ROUTING", "vedge-C1127-8PLTEP", "vedge-C1127-8PLTEP-SD-ROUTING", "vedge-C1127-8PMLTEP",
+    "vedge-C1127-8PMLTEP-SD-ROUTING", "vedge-C1127X-8PLTEP", "vedge-C1127X-8PLTEP-SD-ROUTING", "vedge-C1127X-8PMLTEP",
+    "vedge-C1127X-8PMLTEP-SD-ROUTING", "vedge-C1128-8PLTEP", "vedge-C1128-8PLTEP-SD-ROUTING", "vedge-C1131-8PLTEPW",
+    "vedge-C1131-8PLTEPW-SD-ROUTING", "vedge-C1131-8PW", "vedge-C1131-8PW-SD-ROUTING", "vedge-C1131X-8PLTEPW",
+    "vedge-C1131X-8PLTEPW-SD-ROUTING", "vedge-C1131X-8PW", "vedge-C1131X-8PW-SD-ROUTING", "vedge-C1161-8P",
+    "vedge-C1161-8P-SD-ROUTING", "vedge-C1161-8PLTEP", "vedge-C1161-8PLTEP-SD-ROUTING", "vedge-C1161X-8P",
+    "vedge-C1161X-8P-SD-ROUTING", "vedge-C1161X-8PLTEP", "vedge-C1161X-8PLTEP-SD-ROUTING", "vedge-C8000V",
+    "vedge-C8000V-SD-ROUTING", "vedge-C8200-1N-4T", "vedge-C8200-1N-4T-SD-ROUTING", "vedge-C8200L-1N-4T",
+    "vedge-C8200L-1N-4T-SD-ROUTING", "vedge-C8300-1N1S-4T2X", "vedge-C8300-1N1S-4T2X-SD-ROUTING", "vedge-C8300-1N1S-6T",
+    "vedge-C8300-1N1S-6T-SD-ROUTING", "vedge-C8300-2N2S-4T2X", "vedge-C8300-2N2S-4T2X-SD-ROUTING",
+    "vedge-C8300-2N2S-6T", "vedge-C8300-2N2S-6T-SD-ROUTING", "vedge-C8500-12X", "vedge-C8500-12X-SD-ROUTING",
+    "vedge-C8500-12X4QC", "vedge-C8500-12X4QC-SD-ROUTING", "vedge-C8500-20X6C", "vedge-C8500-20X6C-SD-ROUTING",
+    "vedge-C8500L-8S4X", "vedge-C8500L-8S4X-SD-ROUTING", "vedge-CSR-1000v", "vedge-ESR-6300", "vedge-ESR-6300-LIC",
+    "vedge-ESR-6300-LIC-SD-ROUTING", "vedge-ESR-6300-NCP", "vedge-ESR-6300-NCP-SD-ROUTING", "vedge-ESR-6300-SD-ROUTING",
+    "vedge-IR-1101", "vedge-IR-1101-SD-ROUTING", "vedge-IR-1821", "vedge-IR-1821-SD-ROUTING", "vedge-IR-1831",
+    "vedge-IR-1831-SD-ROUTING", "vedge-IR-1833", "vedge-IR-1833-SD-ROUTING", "vedge-IR-1835",
+    "vedge-IR-1835-SD-ROUTING", "vedge-IR-8140H", "vedge-IR-8140H-P", "vedge-IR-8140H-P-SD-ROUTING",
+    "vedge-IR-8140H-SD-ROUTING", "vedge-IR-8340", "vedge-IR-8340-SD-ROUTING", "vedge-ISR-4221",
+    "vedge-ISR-4221-SD-ROUTING", "vedge-ISR-4221X", "vedge-ISR-4221X-SD-ROUTING", "vedge-ISR-4321",
+    "vedge-ISR-4321-SD-ROUTING", "vedge-ISR-4331", "vedge-ISR-4331-SD-ROUTING", "vedge-ISR-4351",
+    "vedge-ISR-4351-SD-ROUTING", "vedge-ISR-4431", "vedge-ISR-4431-SD-ROUTING", "vedge-ISR-4451-X",
+    "vedge-ISR-4451-X-SD-ROUTING", "vedge-ISR-4461", "vedge-ISR-4461-SD-ROUTING", "vedge-ISR1100-4G-XE",
+    "vedge-ISR1100-4GLTEGB-XE", "vedge-ISR1100-4GLTENA-XE", "vedge-ISR1100-6G-XE", "vedge-ISR1100X-4G-XE",
+    "vedge-ISR1100X-6G-XE", "vedge-ISRv", "vedge-nfvis-C8200-UCPE", "vedge-nfvis-C8200-UCPEVM",
+    "vedge-nfvis-C8300-UCPE-1N20", "vedge-nfvis-CSP-5216", "vedge-nfvis-CSP-5228", "vedge-nfvis-CSP-5436",
+    "vedge-nfvis-ENCS5400"
+}
+# Software devices. Updated as of SD-WAN Manager 20.12
+SOFT_EDGE_SET = {"vedge-CSR-1000v", "vedge-C8000V", "vedge-C8000V-SD-ROUTING", "vedge-cloud", "vmanage", "vsmart",
+                 "vedge-ISRv"}
+
+
+class DeviceType(Enum):
+    vsmart = 'vsmart'       # SD-WAN Controller
+    vmanage = 'vmanage'     # SD-WAN Manager
+    vbond = 'vbond'         # SD-WAN Validator
+    vedge = 'vedge'
+    cedge = 'cedge'
+
+
+def get_device_type(device_class: str, device_model: str) -> str:
+    if device_class == DeviceType.vedge.value:
+        return DeviceType.cedge.value if device_model in CEDGE_SET else DeviceType.vedge.value
+    return device_class
+
+
+#
+# Tags
+#
+class Tag(ConfigItem):
+    api_path = ApiPath('v1/tags')
+    store_path = ('tags',)
+    id_tag = 'id'
+    name_tag = 'name'
+    # Skipping compare for all keys from tag payload to prevent update operations, which is not supported by the
+    # SD-WAN manager. Exception is tagAssociation, which when different will trigger tag to device association.
+    skip_cmp_tag_set = {'description', 'type'}
+
+    @staticmethod
+    def delete_params(tag_id: str) -> dict[str, str]:
+        """
+        Build dictionary used to provide url parameters for api DELETE call
+        @param tag_id: Tag ID string
+        @return: Dictionary used to provide DELETE url parameters
+        """
+        return {
+            "tagId": tag_id,
+        }
+
+    def post_data(self, id_mapping_dict: Optional[Mapping[str, str]] = None) -> dict[str, Any]:
+        # Need to include this additional structure due to differences between get data (which is what is saved in
+        # the backup) and the required post data.
+        return {
+            'data': [super().post_data(id_mapping_dict)]
+        }
+
+    def device_associations(self) -> Iterator[str]:
+        return (entry['id'] for entry in self.data.get('tagAssociation', []) if entry.get('objectType', '') == 'DEVICE')
+
+
+@register('tag', 'tag', Tag)
+class TagIndex(IndexConfigItem):
+    api_path = ApiPath('v1/tags', None, None, None)
+    store_file = 'tags.json'
+    iter_fields = IdName('id', 'name')
+
+
+#
+# Rules
+#
+class Rule(ConfigItem):
+    api_path = ApiPath('v1/rules')
+    store_path = ('rules',)
+    id_tag = 'id'
+    name_tag = 'name'
+    skip_cmp_tag_set = {'name', 'description'}
+    post_filtered_tags = ('metaDataList', 'association')
+
+    # In 20.15 get rules contains 'matchType' key under 'matchCriteria', while put request requires 'match-type' instead
+    def __init__(self, data: dict[str, Any]):
+        match_criteria = data.get('matchCriteria', {})
+        if (match_type := match_criteria.pop('matchType', None)) is not None:
+            match_criteria['match-type'] = match_type
+        super().__init__(data)
+
+    @staticmethod
+    def delete_params(rule_id: str) -> dict[str, str]:
+        """
+        Build dictionary used to provide url parameters for api DELETE call
+        @param rule_id: Rule ID string
+        @return: Dictionary used to provide DELETE url parameters
+        """
+        return {
+            "ruleId": rule_id,
+        }
+
+    @staticmethod
+    def build_name(config_group_id: str) -> str:
+        return f'{config_group_id}_name'
+
+    def config_group_associations(self) -> Iterator[str]:
+        return (
+            entry['id'] for entry in self.data.get('association', []) if entry.get('objectType', '') == 'CONFIG_GROUP'
+        )
+
+    def update_name(self, id_mapping_dict: Mapping[str, str]) -> None:
+        """
+        Update the name for this Rule for the target SD-WAN manager, when applicable. Rule names for config-group
+        associations follow the format <config_group uuid>_name. Other types of rules, such as topology association
+        rules follow a regular name (ex. hubRule_name). Only config-group association rule names need to be updated
+        because the config-group UUID will be different on the target SD-WAN manager.
+        The new name is then constructed by replacing the old config-group UUID with the new UUID of that same
+        config-group on the target SD-WAN manager.
+        @param id_mapping_dict: {<old item id>: <new item id>} dict. Used to find the mapping of old config-group UUID
+                                and new config-group UUID.
+        """
+        match = re.match(r'(?P<uuid>[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12})_name', self.name,
+                         flags=re.IGNORECASE)
+        if not match:
+            # Not a config-group association rule, no-op in this case.
+            return
+
+        new_uuid = id_mapping_dict.get(match.group('uuid'))
+        if new_uuid is None:
+            raise ValueError(f'Cannot determine new rule name, config-group ID not found: {match.group("uuid")}')
+
+        self.data[self.name_tag] = self.build_name(new_uuid)
+
+
+@register('rule', 'rule', Rule, min_version='20.15')
+class RuleIndex(IndexConfigItem):
+    api_path = ApiPath('v1/rules', None, None, None)
+    store_file = 'rules.json'
+    iter_fields = IdName('id', 'name')
+
+
+#
+# Templates
+#
+# This is a special case handled under DeviceTemplate
+class DeviceTemplateAttached(IndexConfigItem):
+    api_path = ApiPath('template/device/config/attached', None, None, None)
+    store_path = ('device_templates', 'attached')
+    store_file = '{item_name}.json'
+    iter_fields = ('uuid', 'personality')
+
+
+# This is a special case handled under DeviceTemplate
+class DeviceTemplateValues(ConfigItem):
+    api_path = ApiPath(None, 'template/device/config/input', None, None)
+    store_path = ('device_templates', 'values')
+
+    @staticmethod
+    def api_params(template_id: str, device_uuids: Iterable[str]) -> dict[str, Any]:
+        """
+        Build dictionary used to provide input parameters for api POST call
+        @param template_id: Template ID string
+        @param device_uuids: Iterable of device UUIDs
+        @return: Dictionary used to provide POST input parameters
+        """
+        return {
+            "deviceIds": list(device_uuids),
+            "isEdited": False,
+            "isMasterEdited": False,
+            "templateId": template_id
+        }
+
+    def input_list(self, allowed_uuid_set=None):
+        """
+        Return list of device input entries. Each entry represents one attached device and is a dictionary of input
+        variable names and values.
+        @param allowed_uuid_set: Optional, set of uuids. If provided, only input entries for those uuids are returned
+        @return: [{<input_var_name>: <input_var_value>, ...}, ...]
+        """
+        return [entry for entry in self.data.get('data', [])
+                if allowed_uuid_set is None or entry.get('csv-deviceId') in allowed_uuid_set]
+
+    @staticmethod
+    def input_list_devices(input_list: list) -> Iterable[str]:
+        return (entry.get('csv-host-name') for entry in input_list)
+
+    def values_iter(self):
+        return (
+            (entry.get('csv-deviceId', ''), entry.get('csv-host-name', ''), entry)
+            for entry in self.data.get('data', [])
+        )
+
+    def title_dict(self):
+        return {column['property']: column['title'] for column in self.data.get('header', {}).get('columns', [])}
+
+    def __iter__(self):
+        return self.values_iter()
+
+    @classmethod
+    def get_values_raise(cls, api: Rest, template_id: str, device_uuids: Iterable[str]):
+        return cls(api.post(cls.api_params(template_id, device_uuids), cls.api_path.post))
+
+    @classmethod
+    def get_values(cls, api: Rest, template_id: str, device_uuids: Iterable[str]):
+        try:
+            return cls.get_values_raise(api, template_id, device_uuids)
+        except RestAPIException:
+            return None
+
+
+class DeviceTemplate(ConfigItem):
+    api_path = CliOrFeatureApiPath(
+        ApiPath('template/device/object', 'template/device/feature', 'template/device'),
+        ApiPath('template/device/object', 'template/device/cli', 'template/device')
+    )
+    store_path = ('device_templates', 'template')
+    name_tag = 'templateName'
+    id_tag = 'templateId'
+    type_tag = 'deviceType'
+    post_filtered_tags = ('feature',)
+    # templateClass, deviceRole, draftMode, templateId and copyEdited are new tags in 20.x+, adding to skip diff to not
+    # trigger updates when restore --update is done between pre 20.x workdir and post 20.x SD-WAN Manager.
+    skip_cmp_tag_set = {'createdOn', 'createdBy', 'lastUpdatedBy', 'lastUpdatedOn', '@rid', 'owner', 'infoTag',
+                        'templateAttached', 'templateConfigurationEdited', 'templateClass', 'deviceRole', 'draftMode',
+                        'templateId', 'copyEdited'}
+
+    def __init__(self, data):
+        """
+        @param data: dict containing the information to be associated with this config item
+        """
+        super().__init__(data)
+
+        self.devices_attached: Optional[DeviceTemplateAttached] = None
+        self.attach_values: Optional[DeviceTemplateValues] = None
+
+    @property
+    def is_type_cli(self) -> bool:
+        return self.data.get('configType', 'template') == 'file'
+
+    @property
+    def is_cedge(self) -> bool:
+        return self.data['deviceType'] in CEDGE_SET
+
+    def contains_template(self, template_type: str) -> bool:
+        return template_type in self.find_key('templateType')
+
+    @property
+    def feature_templates(self) -> set[str]:
+        return set(self.find_key('templateId', from_key='generalTemplates'))
+
+
+@register('template_device', 'device template', DeviceTemplate)
+class DeviceTemplateIndex(IndexConfigItem):
+    api_path = ApiPath('template/device', None, None, None)
+    store_file = 'device_templates.json'
+    iter_fields = IdName('templateId', 'templateName')
+
+    FilterEntry = namedtuple('FilterEntry', ['template_class', 'device_type', 'num_attached', 'uuid', 'name'])
+
+    @staticmethod
+    def is_vsmart(entry: FilterEntry) -> bool:
+        """Filtered_iter filter selecting SD-WAN Controller templates (vsmart)"""
+        return entry.device_type is not None and entry.device_type == 'vsmart'
+
+    @staticmethod
+    def is_not_vsmart(entry: FilterEntry) -> bool:
+        """Filtered_iter filter excluding SD-WAN Controller templates (vsmart)"""
+        return entry.device_type is not None and entry.device_type != 'vsmart'
+
+    @staticmethod
+    def is_attached(entry: FilterEntry) -> bool:
+        return entry.num_attached is not None and entry.num_attached > 0
+
+    @staticmethod
+    def is_cedge(entry: FilterEntry) -> bool:
+        # Before 20.1 template migration
+        if entry.template_class is None:
+            return entry.device_type is not None and entry.device_type in CEDGE_SET
+
+        # Post 20.1 template migration
+        return entry.template_class == 'cedge'
+
+    @staticmethod
+    def is_vedge(entry: FilterEntry) -> bool:
+        is_controller = entry.device_type is not None and entry.device_type in {'vsmart', 'vbond', 'vmanage'}
+
+        return not is_controller and not DeviceTemplateIndex.is_cedge(entry)
+
+    def filtered_iter(self, *filter_fns: Callable) -> Iterable[tuple[str, str]]:
+        # The contract for filtered_iter is that it should return an iterable of iter_fields tuples.
+        # If no filter_fns is provided, no filtering is done and iterate over all entries
+        return (
+            (entry.uuid, entry.name)
+            for entry in map(DeviceTemplateIndex.FilterEntry._make, self.iter('templateClass', 'deviceType',
+                                                                              'devicesAttached', *self.iter_fields))
+            if all(filter_fn(entry) for filter_fn in filter_fns)
+        )
+
+    @classmethod
+    def create(cls, item_list: Sequence[DeviceTemplate], id_hint_dict: Mapping[str, str]):
+        def index_entry_dict(item_obj: DeviceTemplate):
+            entry_dict = {
+                key: item_obj.data.get(key, id_hint_dict.get(item_obj.name)) for key in cls.iter_fields
+            }
+            entry_dict['deviceType'] = item_obj.data.get('deviceType')
+
+            if item_obj.devices_attached is not None:
+                entry_dict['devicesAttached'] = len(list(item_obj.devices_attached))
+            else:
+                entry_dict['devicesAttached'] = 0
+
+            return entry_dict
+
+        index_payload = {
+            'data': [index_entry_dict(item) for item in item_list]
+        }
+        return cls(index_payload)
+
+
+class FeatureTemplate(ConfigItem):
+    api_path = ApiPath('template/feature/object', 'template/feature')
+    store_path = ('feature_templates',)
+    id_tag = 'templateId'
+    name_tag = 'templateName'
+    type_tag = 'templateType'
+    # gTemplateClass is new in 20.x, adding skip diff to not trigger updates when restore --update is done between
+    # pre 20.x workdir and post 20.x SD-WAN Manager.
+    skip_cmp_tag_set = {'createdOn', 'createdBy', 'lastUpdatedBy', 'lastUpdatedOn', '@rid', 'owner', 'infoTag',
+                        'devicesAttached', 'attachedMastersCount', 'gTemplateClass', 'editedTemplateDefinition'}
+    post_filtered_tags = ('editedTemplateDefinition',)
+
+    @property
+    def device_types(self) -> set[str]:
+        return set(self.data.get('deviceType', []))
+
+    @device_types.setter
+    def device_types(self, device_type_iter: Iterable[str]) -> None:
+        self.data['deviceType'] = [device_type for device_type in device_type_iter]
+
+    @property
+    def masters_attached(self) -> int:
+        """
+        Returns number of device templates (i.e., master templates) that use this feature template
+        """
+        return self.data.get('attachedMastersCount')
+
+    @property
+    def devices_attached(self) -> int:
+        """
+        Returns number of devices attached to device templates attached to this feature template
+        """
+        return self.data.get('devicesAttached')
+
+
+@register('template_feature', 'feature template', FeatureTemplate)
+class FeatureTemplateIndex(IndexConfigItem):
+    api_path = ApiPath('template/feature', None, None, None)
+    store_file = 'feature_templates.json'
+    iter_fields = IdName('templateId', 'templateName')
+
+
+#
+# Config Group
+#
+
+class ConfigGroupProfileModel(ConfigRequestModel):
+    id: str
+
+
+class ConfigGroupModel(ConfigRequestModel):
+    name: str
+    description: str
+    solution: str
+    profiles: Optional[list[ConfigGroupProfileModel]] = None
+    topology: Optional[dict[str, Any]] = None
+
+
+class ConfigGroup(Config2Item):
+    api_path = ApiPath('v1/config-group')
+    store_path = ('config_groups', 'group')
+    id_tag = 'id'
+    name_tag = 'name'
+
+    post_model = ConfigGroupModel
+
+    @property
+    def devices_associated(self) -> int:
+        return self.data.get('numberOfDevices', 0)
+
+
+@register('config_group', 'configuration group', ConfigGroup, min_version='20.8')
+class ConfigGroupIndex(IndexConfigItem):
+    api_path = ApiPath('v1/config-group', None, None, None)
+    store_file = 'config_groups.json'
+    iter_fields = IdName('id', 'name')
+
+
+class NameValuePair(ConfigRequestModel):
+    name: str
+    value: Optional[Any] = None
+
+
+class DeviceValuesModel(ConfigRequestModel):
+    device_id: str = Field(..., alias='device-id')
+    variables: list[NameValuePair]
+
+
+class ConfigGroupValuesModel(ConfigRequestModel):
+    solution: str
+    devices: list[DeviceValuesModel]
+
+    # In 20.8.1 get values contains 'family' key while put request requires 'solution' instead
+    def __init__(self, **kwargs):
+        solution = kwargs.pop('solution', None) or kwargs.pop('family', None)
+        if solution is not None:
+            kwargs['solution'] = solution
+        super().__init__(**kwargs)
+
+
+class ConfigGroupValues(Config2Item):
+    api_path = ApiPath('v1/config-group/{configGroupId}/device/variables', None,
+                       'v1/config-group/{configGroupId}/device/variables', None)
+    store_path = ('config_groups', 'values')
+
+    post_model = ConfigGroupValuesModel
+
+    @property
+    def uuids(self) -> Iterable[str]:
+        return (entry['device-id'] for entry in self.data.get('devices', []) if 'device-id' in entry)
+
+    @property
+    def is_empty(self) -> bool:
+        return self.data is None or len(self.data.get('devices', [])) == 0
+
+    def filter(self, allowed_uuid_set: set[str]) -> 'ConfigGroupValues':
+        """
+        Return a new instance of ConfigGroupValues containing only device entries with an id that is present in
+        allowed_uuid_set.
+        @param allowed_uuid_set: Set of device uuids that are allowed
+        @return: Filtered ConfigGroupValues instance
+        """
+        new_payload = deepcopy(self.data)
+        new_payload['devices'] = [
+            entry for entry in new_payload.get('devices', []) if entry.get('device-id') in allowed_uuid_set
+        ]
+        return ConfigGroupValues(new_payload)
+
+    def put_raise(self, api: Rest, **path_vars: str) -> list[str]:
+        result = api.put(self.put_data(), ConfigGroupValues.api_path.resolve(**path_vars).put)
+
+        # Prior to 20.12, this api call returned a list of dicts. Since 20.12, it now returns a list of strings.
+        return result if any(isinstance(dvc, str) for dvc in result) else [dvc.get('device-id') for dvc in result]
+
+
+class AssociatedDeviceModel(ConfigRequestModel):
+    id: str
+
+
+class ConfigGroupAssociatedModel(ConfigRequestModel):
+    devices: list[AssociatedDeviceModel]
+
+
+class ConfigGroupAssociated(Config2Item):
+    api_path = ApiPath('v1/config-group/{configGroupId}/device/associate')
+    store_path = ('config_groups', 'associated')
+
+    post_model = ConfigGroupAssociatedModel
+
+    ActionWorker = namedtuple('ActionWorker', ['uuid', ])
+
+    @property
+    def uuids(self) -> Iterable[str]:
+        return (entry['id'] for entry in self.data.get('devices', []) if 'id' in entry)
+
+    @property
+    def is_empty(self) -> bool:
+        return self.data is None or len(self.data.get('devices', [])) == 0
+
+    def filter(self, allowed_uuid_set: Optional[set[str]] = None, not_by_rule: bool = False) -> 'ConfigGroupAssociated':
+        """
+        Return a new instance of ConfigGroupAssociated containing only device entries with an id that is present in
+        allowed_uuid_set.
+        @param allowed_uuid_set: Set of device uuids that are allowed. If not provided, do not filter by uuid.
+        @param not_by_rule: If True, only include devices that were not added by tag rules.
+        @return: Filtered ConfigGroupAssociated instance
+        """
+        new_payload = deepcopy(self.data)
+        new_payload['devices'] = [
+            entry for entry in new_payload.get('devices', [])
+            if (
+                    (allowed_uuid_set is None or entry.get('id') in allowed_uuid_set) and
+                    (not not_by_rule or not entry.get('addedByRule', False))
+            )
+        ]
+        return ConfigGroupAssociated(new_payload)
+
+    def put_raise(self, api: Rest, **path_vars: str) -> None:
+        api.put(self.put_data(), ConfigGroupAssociated.api_path.resolve(**path_vars).put)
+
+    @staticmethod
+    def delete_raise(api: Rest, uuids: Iterable[str], **path_vars: str) -> ActionWorker:
+        payload = {
+            "devices": [
+                {"id": device_id} for device_id in uuids
+            ]
+        }
+        response = api.delete(ConfigGroupAssociated.api_path.resolve(**path_vars).delete, input_data=payload)
+
+        return ConfigGroupAssociated.ActionWorker(uuid=response.get('parentTaskId'))
+
+
+class ConfigGroupDeploy(ApiItem):
+    api_path = ApiPath(None, 'v1/config-group/{configGroupId}/device/deploy', None, None)
+    id_tag = 'parentTaskId'
+
+    @staticmethod
+    def api_params(uuids: Iterable[str]) -> dict[str, Any]:
+        """
+        Build dictionary used to provide input parameters for api POST call
+        @param uuids: An iterable of device UUIDs to deploy
+        @return: Dictionary used to provide POST input parameters
+        """
+        return {
+            "devices": [
+                {"id": device_id} for device_id in uuids
+            ]
+        }
+
+
+#
+# SDWAN Feature Profiles
+#
+
+class ProfileSdwanPolicy(FeatureProfile):
+    api_path = ApiPath('v1/feature-profile/sdwan/policy-object')
+    store_path = ('feature_profiles', 'sdwan', 'policy_object')
+
+    ordered_parcel_names = (
+        "app-list", "class", "app-probe", "as-path",  "color", "data-prefix", "data-ipv6-prefix", "ext-community",
+        "standard-community", "expanded-community", "ipv6-prefix", "mirror", "policer", "preferred-color-group",
+        "prefix", "security-zone", "security-scalablegrouptag", "security-identity", "security-geolocation",
+        "security-protocolname", "security-urllist", "security-ipssignature", "security-localdomain",
+        "security-localapp", "security-port", "security-fqdn", "security-data-ip-prefix", "sla-class", "tloc",
+        "vpn-group", "unified/advanced-inspection-profile", "unified/intrusion-prevention", "unified/url-filtering",
+        "unified/advanced-malware-protection", "unified/ssl-decryption-profile", "unified/ssl-decryption",
+        "ipv4-network-object-group", "ipv4-service-object-group"
+    )
+    parcel_api_paths = ApiPathGroup({
+        name: ApiPath(f"v1/feature-profile/sdwan/policy-object/{{policyId}}/{name}") for name in ordered_parcel_names
+    })
+
+
+@register('policy_object', 'SDWAN policy object', ProfileSdwanPolicy, min_version='20.10')
+class ProfileSdwanPolicyIndex(FeatureProfileIndex):
+    api_path = ApiPath('v1/feature-profile/sdwan/policy-object', None, None, None)
+    store_file = 'feature_profiles_sdwan_policy_object.json'
+
+
+class ProfileSdwanSystem(FeatureProfile):
+    api_path = ApiPath('v1/feature-profile/sdwan/system')
+    store_path = ('feature_profiles', 'sdwan', 'system')
+
+    parcel_names = (
+        "aaa", "global", "banner", "basic", "bfd", "logging", "ntp", "omp", "snmp", "perfmonitor", "mrf", "security",
+        "remote-access", "ipv4-device-access-policy", "ipv6-device-access-policy"
+    )
+    parcel_api_paths = ApiPathGroup({
+        name: ApiPath(f"v1/feature-profile/sdwan/system/{{systemId}}/{name}") for name in parcel_names
+    }, parcel_reference_path_map={
+        PathKey("data-prefix", "ipv4-device-access-policy"): ...,
+        PathKey("data-ipv6-prefix", "ipv6-device-access-policy"): ...
+    })
+
+
+@register('feature_profile', 'SDWAN system profile', ProfileSdwanSystem, min_version='20.8')
+class ProfileSdwanSystemIndex(FeatureProfileIndex):
+    api_path = ApiPath('v1/feature-profile/sdwan/system', None, None, None)
+    store_file = 'feature_profiles_sdwan_system.json'
+
+
+class ProfileSdwanService(FeatureProfile):
+    api_path = ApiPath('v1/feature-profile/sdwan/service')
+    store_path = ('feature_profiles', 'sdwan', 'service')
+    ordered_parcel_names = ("route-policy", "routing/bgp", "routing/ospf", "routing/eigrp", "routing/ospfv3/ipv4",
+                            "routing/ospfv3/ipv6", "routing/multicast")
+    parcel_api_paths = ApiPathGroup({
+        "dhcp-server": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/dhcp-server"),
+        "routing/bgp": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/routing/bgp"),
+        "routing/ospf": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/routing/ospf"),
+        "routing/eigrp": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/routing/eigrp"),
+        "routing/ospfv3/ipv4": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/routing/ospfv3/ipv4"),
+        "routing/ospfv3/ipv6": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/routing/ospfv3/ipv6"),
+        "routing/multicast": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/routing/multicast"),
+        "tracker": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/tracker"),
+        "objecttracker": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/objecttracker"),
+        "objecttrackergroup": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/objecttrackergroup"),
+        "trackergroup": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/trackergroup"),
+        "dual-router-ha": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/dual-router-ha"),
+        "lan/vpn": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/lan/vpn"),
+        "lan/vpn/interface/ethernet": ApiPath(
+            "v1/feature-profile/sdwan/service/{serviceId}/lan/vpn/{vpnId}/interface/ethernet"),
+        "lan/vpn/interface/svi": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/lan/vpn/{vpnId}/interface/svi"),
+        "lan/vpn/interface/ipsec": ApiPath(
+            "v1/feature-profile/sdwan/service/{serviceId}/lan/vpn/{vpnId}/interface/ipsec"),
+        "lan/vpn/interface/gre": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/lan/vpn/{vpnId}/interface/gre"),
+        "switchport": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/switchport"),
+        "wirelesslan": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/wirelesslan"),
+        "appqoe": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/appqoe"),
+        "route-policy": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/route-policy"),
+        "ipv4-acl": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/ipv4-acl"),
+        "ipv6-acl": ApiPath("v1/feature-profile/sdwan/service/{serviceId}/ipv6-acl")
+    }, parcel_reference_path_map={
+        PathKey("dhcp-server", "lan/vpn/interface/ethernet"): ApiPath(
+            "v1/feature-profile/sdwan/service/{serviceId}/lan/vpn/{vpnId}/interface/ethernet/{ethId}/dhcp-server"),
+        PathKey("dhcp-server", "lan/vpn/interface/svi"): ApiPath(
+            "v1/feature-profile/sdwan/service/{serviceId}/lan/vpn/{vpnId}/interface/svi/{sviId}/dhcp-server"),
+        PathKey("dhcp-server", "lan/vpn/interface/ipsec"): ApiPath(
+            "v1/feature-profile/sdwan/service/{serviceId}/lan/vpn/{vpnId}/interface/ipsec/{ipsecId}/dhcp-server"),
+        PathKey("routing/bgp", "lan/vpn"): ApiPath(
+            "v1/feature-profile/sdwan/service/{serviceId}/lan/vpn/{vpnId}/routing/bgp"),
+        PathKey("routing/ospf", "lan/vpn"): ApiPath(
+            "v1/feature-profile/sdwan/service/{serviceId}/lan/vpn/{vpnId}/routing/ospf"),
+        PathKey("routing/eigrp", "lan/vpn"): ApiPath(
+            "v1/feature-profile/sdwan/service/{serviceId}/lan/vpn/{vpnId}/routing/eigrp"),
+        PathKey("routing/ospfv3/ipv4", "lan/vpn"): ApiPath(
+            "v1/feature-profile/sdwan/service/{serviceId}/lan/vpn/{vpnId}/routing/ospfv3/ipv4"),
+        PathKey("routing/ospfv3/ipv6", "lan/vpn"): ApiPath(
+            "v1/feature-profile/sdwan/service/{serviceId}/lan/vpn/{vpnId}/routing/ospfv3/ipv6"),
+        PathKey("routing/multicast", "lan/vpn"): ApiPath(
+            "v1/feature-profile/sdwan/service/{serviceId}/lan/vpn/{vpnId}/routing/multicast"),
+        PathKey("tracker", "trackergroup"): ...,
+        PathKey("tracker", "lan/vpn"): ...,
+        PathKey("tracker", "lan/vpn/interface/ethernet"): ApiPath(
+            "v1/feature-profile/sdwan/service/{serviceId}/lan/vpn/{vpnId}/interface/ethernet/{ethId}/tracker"),
+        PathKey("objecttracker", "objecttrackergroup"): ...,
+        PathKey("objecttracker", "lan/vpn/interface/ethernet"): ...,
+        PathKey("trackergroup", "lan/vpn"): ...,
+        PathKey("trackergroup", "lan/vpn/interface/ethernet"): ApiPath(
+            "v1/feature-profile/sdwan/service/{serviceId}/lan/vpn/{vpnId}/interface/ethernet/{ethId}/trackergroup"),
+        PathKey("objecttrackergroup", "lan/vpn/interface/ethernet"): ...,
+        PathKey("lan/vpn", "dual-router-ha"): ...,
+        PathKey("lan/vpn/interface/ethernet", "lan/vpn/interface/ethernet"): ...,
+        PathKey("ipv4-acl", "lan/vpn/interface/ethernet"): ...,
+        PathKey("ipv4-acl", "lan/vpn/interface/svi"): ...,
+        PathKey("ipv6-acl", "lan/vpn/interface/ethernet"): ...,
+        PathKey("ipv6-acl", "lan/vpn/interface/svi"): ...,
+        PathKey("route-policy", "routing/bgp"): ...,
+        PathKey("route-policy", "routing/ospf"): ...,
+        PathKey("route-policy", "routing/eigrp"): ...,
+        PathKey("route-policy", "routing/ospfv3/ipv4"): ...,
+        PathKey("route-policy", "routing/ospfv3/ipv6"): ...,
+        PathKey("route-policy", "lan/vpn"): ...,
+    } | {
+        PathKey(policy_obj_parcel, "route-policy"): ...
+        for policy_obj_parcel in ProfileSdwanPolicy.ordered_parcel_names
+    })
+
+
+@register('feature_profile', 'SDWAN service profile', ProfileSdwanService, min_version='20.8')
+class ProfileSdwanServiceIndex(FeatureProfileIndex):
+    api_path = ApiPath('v1/feature-profile/sdwan/service', None, None, None)
+    store_file = 'feature_profiles_sdwan_service.json'
+
+
+class ProfileSdwanTransport(FeatureProfile):
+    api_path = ApiPath('v1/feature-profile/sdwan/transport')
+    store_path = ('feature_profiles', 'sdwan', 'transport')
+    parcel_api_paths = ApiPathGroup({
+        "routing/bgp": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/routing/bgp"),
+        "routing/ospf": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/routing/ospf"),
+        "routing/ospfv3/ipv4": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/routing/ospfv3/ipv4"),
+        "routing/ospfv3/ipv6": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/routing/ospfv3/ipv6"),
+        "tracker": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/tracker"),
+        "trackergroup": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/trackergroup"),
+        "ipv6-tracker": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/ipv6-tracker"),
+        "ipv6-trackergroup": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/ipv6-trackergroup"),
+        "cellular-profile": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/cellular-profile"),
+        "esimcellular-profile": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/esimcellular-profile"),
+        "wan/vpn": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/wan/vpn"),
+        "wan/vpn/interface/ethernet": ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/ethernet"),
+        "wan/vpn/interface/ipsec": ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/ipsec"),
+        "wan/vpn/interface/gre": ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/gre"),
+        "wan/vpn/interface/cellular": ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/cellular"),
+        "wan/vpn/interface/serial": ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/serial"),
+        "wan/vpn/interface/ethpppoe": ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/ethpppoe"),
+        "wan/vpn/interface/dsl-pppoa": ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/dsl-pppoa"),
+        "wan/vpn/interface/dsl-pppoe": ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/dsl-pppoe"),
+        "management/vpn": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/management/vpn"),
+        "management/vpn/interface/ethernet": ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/management/vpn/{vpnId}/interface/ethernet"),
+        "cellular-controller": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/cellular-controller"),
+        "esimcellular-controller": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/esimcellular-controller"),
+        "t1-e1-controller": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/t1-e1-controller"),
+        "gps": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/gps"),
+        "route-policy": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/route-policy"),
+        "ipv4-acl": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/ipv4-acl"),
+        "ipv6-acl": ApiPath("v1/feature-profile/sdwan/transport/{transportId}/ipv6-acl")
+    }, parcel_reference_path_map={
+        PathKey("routing/bgp", "wan/vpn"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/routing/bgp"),
+        PathKey("routing/ospf", "wan/vpn"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/routing/ospf"),
+        PathKey("routing/ospfv3/ipv4", "wan/vpn"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/routing/ospfv3/ipv4"),
+        PathKey("routing/ospfv3/ipv6", "wan/vpn"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/routing/ospfv3/ipv6"),
+        PathKey("tracker", "trackergroup"): ...,
+        PathKey("tracker", "wan/vpn/interface/ethernet"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/ethernet/{ethernetId}/tracker"),
+        PathKey("tracker", "wan/vpn/interface/dsl-pppoe"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/dsl-pppoe/{pppId}/tracker"),
+        PathKey("tracker", "wan/vpn/interface/dsl-pppoa"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/dsl-pppoa/{pppId}/tracker"),
+        PathKey("tracker", "wan/vpn/interface/ethpppoe"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/ethpppoe/{pppId}/tracker"),
+        PathKey("tracker", "wan/vpn/interface/ipsec"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/ipsec/{ipsecId}/tracker"),
+        PathKey("tracker", "wan/vpn/interface/gre"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/gre/{greId}/tracker"),
+        PathKey("tracker", "wan/vpn/interface/cellular"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/cellular/{cellularId}/tracker"),
+        PathKey("trackergroup", "wan/vpn/interface/ethernet"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/ethernet/"
+            "{ethernetId}/trackergroup"),
+        PathKey("ipv6-tracker", "ipv6-trackergroup"): ...,
+        PathKey("ipv6-tracker", "wan/vpn/interface/ethernet"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/ethernet/"
+            "{ethernetId}/ipv6-tracker"),
+        PathKey("ipv6-tracker", "wan/vpn/interface/cellular"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/cellular/"
+            "{cellularId}/ipv6-tracker"),
+        PathKey("ipv6-trackergroup", "wan/vpn/interface/ethernet"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/ethernet/"
+            "{ethernetId}/ipv6-trackergroup"),
+        PathKey("ipv6-trackergroup", "wan/vpn/interface/cellular"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/wan/vpn/{vpnId}/interface/cellular/"
+            "{cellularId}/ipv6-trackergroup"),
+        PathKey("cellular-profile", "cellular-controller"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/cellular-controller/"
+            "{cellularControllerId}/cellular-profile"),
+        PathKey("gps", "cellular-controller"): ApiPath(
+            "v1/feature-profile/sdwan/transport/{transportId}/cellular-controller/{cellularControllerId}/gps"),
+        PathKey("route-policy", "routing/bgp"): ...,
+        PathKey("route-policy", "routing/ospf"): ...,
+        PathKey("route-policy", "routing/ospfv3/ipv4"): ...,
+        PathKey("route-policy", "routing/ospfv3/ipv6"): ...,
+        PathKey("route-policy", "wan/vpn"): ...,
+        PathKey("ipv4-acl", "wan/vpn/interface/ethernet"): ...,
+        PathKey("ipv4-acl", "wan/vpn/interface/cellular"): ...,
+        PathKey("ipv4-acl", "wan/vpn/interface/dsl-pppoe"): ...,
+        PathKey("ipv4-acl", "wan/vpn/interface/dsl-pppoa"): ...,
+        PathKey("ipv4-acl", "wan/vpn/interface/ethpppoe"): ...,
+        PathKey("ipv6-acl", "wan/vpn/interface/ethernet"): ...,
+        PathKey("ipv6-acl", "wan/vpn/interface/cellular"): ...,
+        PathKey("ipv6-acl", "wan/vpn/interface/dsl-pppoe"): ...,
+        PathKey("ipv6-acl", "wan/vpn/interface/dsl-pppoa"): ...,
+        PathKey("ipv6-acl", "wan/vpn/interface/ethpppoe"): ...,
+        PathKey("wan/vpn/interface/ethernet", "wan/vpn/interface/ethernet"): ...,
+    } | {
+        PathKey(policy_obj_parcel, "route-policy"): ...
+        for policy_obj_parcel in ProfileSdwanPolicy.ordered_parcel_names
+    })
+
+
+@register('feature_profile', 'SDWAN transport profile', ProfileSdwanTransport, min_version='20.8')
+class ProfileSdwanTransportIndex(FeatureProfileIndex):
+    api_path = ApiPath('v1/feature-profile/sdwan/transport', None, None, None)
+    store_file = 'feature_profiles_sdwan_transport.json'
+
+
+class ProfileSdwanCli(FeatureProfile):
+    api_path = ApiPath('v1/feature-profile/sdwan/cli')
+    store_path = ('feature_profiles', 'sdwan', 'cli')
+    parcel_api_paths = ApiPathGroup({
+        "config": ApiPath("v1/feature-profile/sdwan/cli/{cliId}/config")
+    })
+
+
+@register('feature_profile', 'SDWAN CLI profile', ProfileSdwanCli, min_version='20.8')
+class ProfileSdwanCliIndex(FeatureProfileIndex):
+    api_path = ApiPath('v1/feature-profile/sdwan/cli', None, None, None)
+    store_file = 'feature_profiles_sdwan_cli.json'
+
+
+class ProfileSdwanOther(FeatureProfile):
+    api_path = ApiPath('v1/feature-profile/sdwan/other')
+    store_path = ('feature_profiles', 'sdwan', 'other')
+    parcel_api_paths = ApiPathGroup({
+        "thousandeyes": ApiPath("v1/feature-profile/sdwan/other/{otherId}/thousandeyes"),
+        "ucse": ApiPath("v1/feature-profile/sdwan/other/{otherId}/ucse")
+    })
+
+
+@register('feature_profile', 'SDWAN other profile', ProfileSdwanOther, min_version='20.9')
+class ProfileSdwanOtherIndex(FeatureProfileIndex):
+    api_path = ApiPath('v1/feature-profile/sdwan/other', None, None, None)
+    store_file = 'feature_profiles_sdwan_other.json'
+
+
+class ProfileSdwanDnsSecurity(FeatureProfile):
+    api_path = ApiPath('v1/feature-profile/sdwan/dns-security')
+    store_path = ('feature_profiles', 'sdwan', 'dns_security')
+    parcel_api_paths = ApiPathGroup({
+        "dns": ApiPath("v1/feature-profile/sdwan/dns-security/{dnsSecurityId}/dns")
+    })
+
+
+@register('feature_profile', 'SDWAN dns-security profile', ProfileSdwanDnsSecurity, min_version='20.12')
+class ProfileSdwanDnsSecurityIndex(FeatureProfileIndex):
+    api_path = ApiPath('v1/feature-profile/sdwan/dns-security', None, None, None)
+    store_file = 'feature_profiles_sdwan_dns_security.json'
+
+
+class ProfileSdwanSigSecurity(FeatureProfile):
+    api_path = ApiPath('v1/feature-profile/sdwan/sig-security')
+    store_path = ('feature_profiles', 'sdwan', 'sig_security')
+    parcel_api_paths = ApiPathGroup({
+        "sig": ApiPath("v1/feature-profile/sdwan/sig-security/{sigSecurityId}/sig")
+    })
+
+
+@register('feature_profile', 'SDWAN sig-security profile', ProfileSdwanSigSecurity, min_version='20.12')
+class ProfileSdwanSigSecurityIndex(FeatureProfileIndex):
+    api_path = ApiPath('v1/feature-profile/sdwan/sig-security', None, None, None)
+    store_file = 'feature_profiles_sdwan_sig_security.json'
+
+
+class ProfileSdwanApplicationPriority(FeatureProfile):
+    api_path = ApiPath('v1/feature-profile/sdwan/application-priority')
+    store_path = ('feature_profiles', 'sdwan', 'application_priority')
+    parcel_api_paths = ApiPathGroup({
+        "qos-policy": ApiPath("v1/feature-profile/sdwan/application-priority/{appPriorityId}/qos-policy"),
+        "traffic-policy": ApiPath("v1/feature-profile/sdwan/application-priority/{appPriorityId}/traffic-policy"),
+        "policy-settings": ApiPath("v1/feature-profile/sdwan/application-priority/{appPriorityId}/policy-settings"),
+        # cloud-probe is a system-created profile that cannot be explicitly created
+        "cloud-probe": ...
+    }, parcel_reference_path_map={
+        PathKey(policy_obj_parcel, parcel): ...
+        for parcel in ('qos-policy', 'traffic-policy') for policy_obj_parcel in ProfileSdwanPolicy.ordered_parcel_names
+    })
+
+
+@register('feature_profile', 'SDWAN application-priority profile', ProfileSdwanApplicationPriority, min_version='20.12')
+class ProfileSdwanApplicationPriorityIndex(FeatureProfileIndex):
+    api_path = ApiPath('v1/feature-profile/sdwan/application-priority', None, None, None)
+    store_file = 'feature_profiles_sdwan_application_priority.json'
+
+
+class ProfileSdwanEmbeddedSecurity(FeatureProfile):
+    api_path = ApiPath('v1/feature-profile/sdwan/embedded-security')
+    store_path = ('feature_profiles', 'sdwan', 'embedded_security')
+    parcel_api_paths = ApiPathGroup({
+        "policy": ApiPath("v1/feature-profile/sdwan/embedded-security/{securityId}/policy"),
+        "unified/ngfirewall": ApiPath("v1/feature-profile/sdwan/embedded-security/{securityId}/unified/ngfirewall"),
+        "security-port": ApiPath("v1/feature-profile/sdwan/embedded-security/{securityId}/security-port"),
+        "security-data-ip-prefix": ApiPath(
+            "v1/feature-profile/sdwan/embedded-security/{securityId}/security-data-ip-prefix")
+    }, parcel_reference_path_map={
+        PathKey("ngfirewall", "policy"): ...,
+        PathKey("security-zone", "policy"): ...,
+        PathKey("unified/ngfirewall", "policy"): ...,
+        PathKey("unified/intrusion-prevention", "unified/advanced-inspection-profile"): ...,
+        PathKey("unified/url-filtering", "unified/advanced-inspection-profile"): ...,
+    } | {
+        PathKey(policy_obj_parcel, "unified/ngfirewall"): ...
+        for policy_obj_parcel in ProfileSdwanPolicy.ordered_parcel_names
+    })
+
+
+@register('feature_profile', 'SDWAN embedded-security profile', ProfileSdwanEmbeddedSecurity, min_version='20.12')
+class ProfileSdwanEmbeddedSecurityIndex(FeatureProfileIndex):
+    api_path = ApiPath('v1/feature-profile/sdwan/embedded-security', None, None, None)
+    store_file = 'feature_profiles_sdwan_embedded_security.json'
+
+
+#
+# SD-Routing Feature Profiles
+#
+
+class ProfileSdRoutingSystem(FeatureProfile):
+    api_path = ApiPath('v1/feature-profile/sd-routing/system')
+    store_path = ('feature_profiles', 'sd-routing', 'system')
+    parcel_api_paths = ApiPathGroup({
+        "global": ApiPath("v1/feature-profile/sd-routing/system/{systemId}/global"),
+        "banner": ApiPath("v1/feature-profile/sd-routing/system/{systemId}/banner"),
+        "ntp-sd-routing": ApiPath("v1/feature-profile/sd-routing/system/{systemId}/ntp"),
+        "logging-sd-routing": ApiPath("v1/feature-profile/sd-routing/system/{systemId}/logging"),
+        "aaa-sd-routing": ApiPath("v1/feature-profile/sd-routing/system/{systemId}/aaa"),
+    })
+
+
+@register('feature_profile', 'SD-Routing system profile', ProfileSdRoutingSystem, min_version='20.15')
+class ProfileSdRoutingSystemIndex(FeatureProfileIndex):
+    api_path = ApiPath('v1/feature-profile/sd-routing/system', None, None, None)
+    store_file = 'feature_profiles_sd-routing_system.json'
+
+
+class ProfileSdRoutingService(FeatureProfile):
+    api_path = ApiPath('/v1/feature-profile/sd-routing/service')
+    store_path = ('feature_profiles', 'sd-routing', 'service')
+
+    parcel_names = ("multicloud-connection", "dhcp-server", "vrf")
+
+    parcel_api_paths = ApiPathGroup({
+        "vrf/lan/interface/ethernet": ApiPath(
+            "v1/feature-profile/sd-routing/service/{serviceId}/vrf/{vrfId}/interface/ethernet"),
+    } | {
+        name: ApiPath(f"v1/feature-profile/sd-routing/service/{{serviceId}}/{name}") for name in parcel_names
+    }, parcel_reference_path_map={
+        PathKey("dhcp-server", "vrf/lan/interface/ethernet"): ApiPath(
+            "v1/feature-profile/sd-routing/service/{serviceId}/vrf/{vrfId}/interface/ethernet/{ethId}/dhcp-server"),
+    })
+
+
+@register('feature_profile', 'SD-Routing service profile', ProfileSdRoutingService, min_version='20.15')
+class ProfileSdRoutingServiceIndex(FeatureProfileIndex):
+    api_path = ApiPath('/v1/feature-profile/sd-routing/service', None, None, None)
+    store_file = 'feature_profiles_sd-routing_service.json'
+
+
+class ProfileSdRoutingTransport(FeatureProfile):
+    api_path = ApiPath('/v1/feature-profile/sd-routing/transport')
+    store_path = ('feature_profiles', 'sd-routing', 'transport')
+
+    parcel_names = ("multicloud-connection", "global-vrf")
+
+    parcel_api_paths = ApiPathGroup({
+        "global-vrf/wan/interface/ethernet": ApiPath(
+            "v1/feature-profile/sd-routing/transport/{transportId}/global-vrf/{globalVrfId}/interface/ethernet"),
+    } | {
+        name: ApiPath(f"v1/feature-profile/sd-routing/transport/{{transportId}}/{name}") for name in parcel_names
+    })
+
+
+@register('feature_profile', 'SD-Routing transport profile', ProfileSdRoutingTransport, min_version='20.15')
+class ProfileSdRoutingTransportIndex(FeatureProfileIndex):
+    api_path = ApiPath('/v1/feature-profile/sd-routing/transport', None, None, None)
+    store_file = 'feature_profiles_sd-routing_transport.json'
+
+
+class ProfileSdRoutingCli(FeatureProfile):
+    api_path = ApiPath('v1/feature-profile/sd-routing/cli')
+    store_path = ('feature_profiles', 'sd-routing', 'cli')
+    parcel_api_paths = ApiPathGroup({
+        "config": ApiPath("v1/feature-profile/sd-routing/cli/{cliId}/config")
+    })
+
+
+@register('feature_profile', 'SD-Routing CLI profile', ProfileSdRoutingCli, min_version='20.15')
+class ProfileSdRoutingCliIndex(FeatureProfileIndex):
+    api_path = ApiPath('v1/feature-profile/sd-routing/cli', None, None, None)
+    store_file = 'feature_profiles_sd-routing_cli.json'
+
+
+#
+# Topology Groups
+#
+
+class TopologyGroupProfileModel(ConfigRequestModel):
+    id: str
+
+
+class TopologyGroupModel(ConfigRequestModel):
+    name: str
+    description: str
+    solution: str
+    profiles: Optional[list[TopologyGroupProfileModel]] = None
+
+
+class TopologyGroup(Config2Item):
+    api_path = ApiPath('v1/topology-group')
+    store_path = ('topology_groups', 'group')
+    id_tag = 'id'
+    name_tag = 'name'
+
+    post_model = TopologyGroupModel
+
+
+@register('topology_group', 'topology group', TopologyGroup, min_version='20.12')
+class TopologyGroupIndex(IndexConfigItem):
+    api_path = ApiPath('v1/topology-group', None, None, None)
+    store_file = 'topology_groups.json'
+    iter_fields = IdName('id', 'name')
+
+
+#
+# Policy Groups
+#
+
+class PolicyGroupProfileModel(ConfigRequestModel):
+    id: str
+
+
+class PolicyGroupModel(ConfigRequestModel):
+    name: str
+    description: str
+    solution: str
+    profiles: Optional[list[PolicyGroupProfileModel]] = None
+
+
+class PolicyGroup(Config2Item):
+    api_path = ApiPath('v1/policy-group')
+    store_path = ('policy_groups', 'group')
+    id_tag = 'id'
+    name_tag = 'name'
+
+    post_model = PolicyGroupModel
+
+
+@register('policy_group', 'policy group', PolicyGroup, min_version='20.12')
+class PolicyGroupIndex(IndexConfigItem):
+    api_path = ApiPath('v1/policy-group', None, None, None)
+    store_file = 'policy_groups.json'
+    iter_fields = IdName('id', 'name')
+
+
+#
+# Policy vSmart (SD-WAN Controller)
+#
+
+class PolicyVsmart(ConfigItem):
+    api_path = ApiPath('template/policy/vsmart/definition', 'template/policy/vsmart')
+    store_path = ('policy_templates', 'vSmart')
+    name_tag = 'policyName'
+    type_tag = 'policyType'
+    skip_cmp_tag_set = {'isPolicyActivated', 'lastUpdatedOn'}
+
+
+@register('policy_vsmart', 'VSMART policy', PolicyVsmart)
+class PolicyVsmartIndex(IndexConfigItem):
+    api_path = ApiPath('template/policy/vsmart', None, None, None)
+    store_file = 'policy_templates_vsmart.json'
+    iter_fields = IdName('policyId', 'policyName')
+
+    @property
+    def active_policy(self):
+        """
+        Return ID and name from active policy or (None, None) if no policy is active
+        @return: (<id>, <name>) or (None, None)
+        """
+        for is_active, item_id, item_name in self.iter('isPolicyActivated', *self.iter_fields):
+            if is_active:
+                return item_id, item_name
+        return None, None
+
+
+#
+# Policy vEdge
+#
+
+class PolicyVedge(ConfigItem):
+    api_path = ApiPath('template/policy/vedge/definition', 'template/policy/vedge')
+    store_path = ('policy_templates', 'vEdge')
+    name_tag = 'policyName'
+    type_tag = 'policyType'
+
+
+@register('policy_vedge', 'edge policy', PolicyVedge)
+class PolicyVedgeIndex(IndexConfigItem):
+    api_path = ApiPath('template/policy/vedge', None, None, None)
+    store_file = 'policy_templates_vedge.json'
+    iter_fields = IdName('policyId', 'policyName')
+
+
+#
+# Policy Security
+#
+
+class PolicySecurity(ConfigItem):
+    api_path = ApiPath('template/policy/security/definition', 'template/policy/security')
+    store_path = ('policy_templates', 'Security')
+    name_tag = 'policyName'
+    type_tag = 'policyType'
+    # policyUseCase, policyMode are new tags in 20.x+, adding to skip diff to not trigger updates when restore --update
+    # is done between pre 20.x workdir and post 20.x SD-WAN Manager.
+    skip_cmp_tag_set = {'policyUseCase', 'policyMode'}
+
+
+@register('policy_security', 'security policy', PolicySecurity)
+class PolicySecurityIndex(IndexConfigItem):
+    api_path = ApiPath('template/policy/security', None, None, None)
+    store_file = 'policy_templates_security.json'
+    iter_fields = IdName('policyId', 'policyName')
+
+
+#
+# Policy Voice
+#
+
+class PolicyVoice(ConfigItem):
+    api_path = ApiPath('template/policy/voice/definition', 'template/policy/voice')
+    store_path = ('policy_templates', 'Voice')
+    name_tag = 'policyName'
+    type_tag = 'policyType'
+
+
+@register('policy_voice', 'voice policy', PolicyVoice, min_version='20.1')
+class PolicyVoiceIndex(IndexConfigItem):
+    api_path = ApiPath('template/policy/voice', None, None, None)
+    store_file = 'policy_templates_voice.json'
+    iter_fields = IdName('policyId', 'policyName')
+
+
+#
+# Policy Custom Application
+#
+
+class PolicyCustomApp(ConfigItem):
+    api_path = ApiPath('template/policy/customapp')
+    store_path = ('policy_templates', 'CustomApp')
+    name_tag = 'appName'
+    id_tag = 'appId'
+    skip_cmp_tag_set = {'lastUpdated', 'referenceCount', 'references', 'activatedId', 'isActivatedByVsmart', 'owner'}
+    post_filtered_tags = ('referenceCount', 'references')
+
+    def __init__(self, data):
+        """
+        @param data: dict containing the information to be associated with this API item.
+        """
+        # In 20.3.1 the payload returned by SD-WAN Manager contains a 'data' key with the policy definition in it.
+        # This is different from previous versions or other ConfigItems. Overwriting default __init__ to handle both
+        # options.
+        super().__init__(data.get('data', data))
+
+
+@register('policy_customapp', 'custom application policy', PolicyCustomApp, min_version='20.1')
+class PolicyCustomAppIndex(IndexConfigItem):
+    api_path = ApiPath('template/policy/customapp', None, None, None)
+    store_file = 'policy_templates_customapp.json'
+    iter_fields = IdName('appId', 'appName')
+
+
+#
+# Policy definitions
+#
+
+# Policy definition base class
+class PolicyDef(ConfigItem):
+    id_tag = 'definitionId'
+    name_tag = 'name'
+    type_tag = 'type'
+    # mode is new tag in 20.x+, adding to skip diff to not trigger updates when restore --update is done between pre
+    # 20.x workdir and post 20.x SD-WAN Manager.
+    skip_cmp_tag_set = {'lastUpdated', 'referenceCount', 'references', 'activatedId', 'isActivatedByVsmart',
+                        'owner', 'infoTag', 'mode'}
+
+
+# Policy definition index base class
+class PolicyDefIndex(IndexConfigItem):
+    iter_fields = IdName('definitionId', 'name')
+
+
+class PolicyDefData(PolicyDef):
+    api_path = ApiPath('template/policy/definition/data')
+    store_path = ('policy_definitions', 'Data')
+
+
+@register('policy_definition', 'data policy definition', PolicyDefData)
+class PolicyDefDataIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/data', None, None, None)
+    store_file = 'policy_definitions_data.json'
+
+
+class PolicyDefMesh(PolicyDef):
+    api_path = ApiPath('template/policy/definition/mesh')
+    store_path = ('policy_definitions', 'Mesh')
+
+
+@register('policy_definition', 'mesh policy definition', PolicyDefMesh)
+class PolicyDefMeshIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/mesh', None, None, None)
+    store_file = 'policy_definitions_mesh.json'
+
+
+class PolicyDefRewriteRule(PolicyDef):
+    api_path = ApiPath('template/policy/definition/rewriterule')
+    store_path = ('policy_definitions', 'RewriteRule')
+
+
+@register('policy_definition', 'rewrite-rule policy definition', PolicyDefRewriteRule)
+class PolicyDefRewriteRuleIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/rewriterule', None, None, None)
+    store_file = 'policy_definitions_rewriterule.json'
+
+
+class PolicyDefAclv6(PolicyDef):
+    api_path = ApiPath('template/policy/definition/aclv6')
+    store_path = ('policy_definitions', 'ACLv6')
+
+
+@register('policy_definition', 'ACLv6 policy definition', PolicyDefAclv6)
+class PolicyDefAclv6Index(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/aclv6', None, None, None)
+    store_file = 'policy_definitions_aclv6.json'
+
+
+class PolicyDefQosmap(PolicyDef):
+    api_path = ApiPath('template/policy/definition/qosmap')
+    store_path = ('policy_definitions', 'QoSMap')
+
+
+@register('policy_definition', 'QOS-map policy definition', PolicyDefQosmap)
+class PolicyDefQosmapIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/qosmap', None, None, None)
+    store_file = 'policy_definitions_qosmap.json'
+
+
+class PolicyDefUrlfiltering(PolicyDef):
+    api_path = ApiPath('template/policy/definition/urlfiltering')
+    store_path = ('policy_definitions', 'URLFiltering')
+
+
+@register('policy_definition', 'URL-filtering policy definition', PolicyDefUrlfiltering)
+class PolicyDefUrlfilteringIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/urlfiltering', None, None, None)
+    store_file = 'policy_definitions_urlfiltering.json'
+
+
+class PolicyDefZoneBasedFw(PolicyDef):
+    api_path = ApiPath('template/policy/definition/zonebasedfw')
+    store_path = ('policy_definitions', 'ZoneBasedFW')
+
+
+@register('zbfw_policy_definition', 'zone-based FW policy definition', PolicyDefZoneBasedFw)
+class PolicyDefZoneBasedFwIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/zonebasedfw', None, None, None)
+    store_file = 'policy_definitions_zonebasedfw.json'
+
+
+class PolicyDefApproute(PolicyDef):
+    api_path = ApiPath('template/policy/definition/approute')
+    store_path = ('policy_definitions', 'AppRoute')
+
+
+@register('policy_definition', 'appRoute policy definition', PolicyDefApproute)
+class PolicyDefApprouteIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/approute', None, None, None)
+    store_file = 'policy_definitions_approute.json'
+
+
+class PolicyDefVpnmembershipgroup(PolicyDef):
+    api_path = ApiPath('template/policy/definition/vpnmembershipgroup')
+    store_path = ('policy_definitions', 'VPNMembershipGroup')
+
+
+@register('policy_definition', 'VPN membership policy definition', PolicyDefVpnmembershipgroup)
+class PolicyDefVpnmembershipgroupIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/vpnmembershipgroup', None, None, None)
+    store_file = 'policy_definitions_vpnmembershipgroup.json'
+
+
+class PolicyDefAcl(PolicyDef):
+    api_path = ApiPath('template/policy/definition/acl')
+    store_path = ('policy_definitions', 'ACL')
+
+
+@register('policy_definition', 'ACL policy definition', PolicyDefAcl)
+class PolicyDefAclIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/acl', None, None, None)
+    store_file = 'policy_definitions_acl.json'
+
+
+class PolicyDefHubandspoke(PolicyDef):
+    api_path = ApiPath('template/policy/definition/hubandspoke')
+    store_path = ('policy_definitions', 'HubAndSpoke')
+
+
+@register('policy_definition', 'Hub-and-spoke policy definition', PolicyDefHubandspoke)
+class PolicyDefHubandspokeIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/hubandspoke', None, None, None)
+    store_file = 'policy_definitions_hubandspoke.json'
+
+
+class PolicyDefVedgeroute(PolicyDef):
+    api_path = ApiPath('template/policy/definition/vedgeroute')
+    store_path = ('policy_definitions', 'vEdgeRoute')
+
+
+@register('policy_definition', 'edge-route policy definition', PolicyDefVedgeroute)
+class PolicyDefVedgerouteIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/vedgeroute', None, None, None)
+    store_file = 'policy_definitions_vedgeroute.json'
+
+
+class PolicyDefIntrusionprevention(PolicyDef):
+    api_path = ApiPath('template/policy/definition/intrusionprevention')
+    store_path = ('policy_definitions', 'IntrusionPrevention')
+
+
+@register('policy_definition', 'IPS policy definition', PolicyDefIntrusionprevention)
+class PolicyDefIntrusionpreventionIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/intrusionprevention', None, None, None)
+    store_file = 'policy_definitions_intrusionprevention.json'
+
+
+class PolicyDefControl(PolicyDef):
+    api_path = ApiPath('template/policy/definition/control')
+    store_path = ('policy_definitions', 'Control')
+
+
+@register('policy_definition', 'control policy definition', PolicyDefControl)
+class PolicyDefControlIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/control', None, None, None)
+    store_file = 'policy_definitions_control.json'
+
+
+class PolicyDefDnssecurity(PolicyDef):
+    api_path = ApiPath('template/policy/definition/dnssecurity')
+    store_path = ('policy_definitions', 'DNSSecurity')
+
+
+@register('policy_definition', 'dns-security policy definition', PolicyDefDnssecurity)
+class PolicyDefDnssecurityIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/dnssecurity', None, None, None)
+    store_file = 'policy_definitions_dnssecurity.json'
+
+
+class PolicyDefCflowd(PolicyDef):
+    api_path = ApiPath('template/policy/definition/cflowd')
+    store_path = ('policy_definitions', 'Cflowd')
+
+
+@register('policy_definition', 'cflowd policy definition', PolicyDefCflowd)
+class PolicyDefCflowdIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/cflowd', None, None, None)
+    store_file = 'policy_definitions_cflowd.json'
+
+
+class PolicyDefAMP(PolicyDef):
+    api_path = ApiPath('template/policy/definition/advancedMalwareProtection')
+    store_path = ('policy_definitions', 'AMP')
+
+
+@register('policy_definition', 'AMP policy definition', PolicyDefAMP)
+class PolicyDefAMPIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/advancedMalwareProtection', None, None, None)
+    store_file = 'policy_definitions_amp.json'
+
+
+class PolicyDefDeviceAccess(PolicyDef):
+    api_path = ApiPath('template/policy/definition/deviceaccesspolicy')
+    store_path = ('policy_definitions', 'DeviceAccess')
+
+
+@register('policy_definition', 'device access policy definition', PolicyDefDeviceAccess)
+class PolicyDefDeviceAccessIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/deviceaccesspolicy', None, None, None)
+    store_file = 'policy_definitions_deviceaccess.json'
+
+
+class PolicyDefDeviceAccessV6(PolicyDef):
+    api_path = ApiPath('template/policy/definition/deviceaccesspolicyv6')
+    store_path = ('policy_definitions', 'DeviceAccessV6')
+
+
+@register('policy_definition', 'IPv6 device access policy definition', PolicyDefDeviceAccessV6)
+class PolicyDefDeviceAccessV6Index(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/deviceaccesspolicyv6', None, None, None)
+    store_file = 'policy_definitions_deviceaccessv6.json'
+
+
+class PolicyDefDialPeer(PolicyDef):
+    api_path = ApiPath('template/policy/definition/dialpeer')
+    store_path = ('policy_definitions', 'DialPeer')
+
+
+@register('policy_definition', 'dial-peer policy definition', PolicyDefDialPeer, min_version='20.1')
+class PolicyDefDialPeerIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/dialpeer', None, None, None)
+    store_file = 'policy_definitions_dialpeer.json'
+
+
+class PolicyDefPhoneProfile(PolicyDef):
+    api_path = ApiPath('template/policy/definition/srstphoneprofile')
+    store_path = ('policy_definitions', 'PhoneProfile')
+
+
+@register('policy_definition', 'phone profile policy definition', PolicyDefPhoneProfile, min_version='20.1')
+class PolicyDefPhoneProfileIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/srstphoneprofile', None, None, None)
+    store_file = 'policy_definitions_phoneprofile.json'
+
+
+class PolicyDefFXOPort(PolicyDef):
+    api_path = ApiPath('template/policy/definition/fxoport')
+    store_path = ('policy_definitions', 'FXOPort')
+
+
+@register('policy_definition', 'FXO port policy definition', PolicyDefFXOPort, min_version='20.1')
+class PolicyDefFXOPortIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/fxoport', None, None, None)
+    store_file = 'policy_definitions_fxoport.json'
+
+
+class PolicyDefFXSPort(PolicyDef):
+    api_path = ApiPath('template/policy/definition/fxsport')
+    store_path = ('policy_definitions', 'FXSPort')
+
+
+@register('policy_definition', 'FXS port policy definition', PolicyDefFXSPort, min_version='20.1')
+class PolicyDefFXSPortIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/fxsport', None, None, None)
+    store_file = 'policy_definitions_fxsport.json'
+
+
+class PolicyDefFXSDIDPort(PolicyDef):
+    api_path = ApiPath('template/policy/definition/fxsdidport')
+    store_path = ('policy_definitions', 'FXSDIDPort')
+
+
+@register('policy_definition', 'FXS-DID port policy definition', PolicyDefFXSDIDPort, min_version='20.1')
+class PolicyDefFXSDIDPortIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/fxsdidport', None, None, None)
+    store_file = 'policy_definitions_fxsdidport.json'
+
+
+class PolicyDefSSLDecryption(PolicyDef):
+    api_path = ApiPath('template/policy/definition/ssldecryption')
+    store_path = ('policy_definitions', 'SSLDecryption')
+
+
+@register('policy_definition', 'SSL decryption policy definition', PolicyDefSSLDecryption, min_version='20.1')
+class PolicyDefSSLDecryptionIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/ssldecryption', None, None, None)
+    store_file = 'policy_definitions_ssldecryption.json'
+
+
+class PolicyDefUTDProfile(PolicyDef):
+    api_path = ApiPath('template/policy/definition/sslutdprofile')
+    store_path = ('policy_definitions', 'SSLUTDProfile')
+
+
+@register('policy_definition', 'SSL decryption UTD profile policy definition', PolicyDefUTDProfile, min_version='20.1')
+class PolicyDefUTDProfileIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/sslutdprofile', None, None, None)
+    store_file = 'policy_definitions_sslutdprofile.json'
+
+
+class PolicyDefPriisdnPort(PolicyDef):
+    api_path = ApiPath('template/policy/definition/priisdnport')
+    store_path = ('policy_definitions', 'PriisdnPort')
+
+
+@register('policy_definition', 'pri isdn port policy definition', PolicyDefPriisdnPort, min_version='20.3')
+class PolicyDefPriisdnPortIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/priisdnport', None, None, None)
+    store_file = 'policy_definitions_priisdnport.json'
+
+
+class PolicyDefRuleSet(PolicyDef):
+    api_path = ApiPath('template/policy/definition/ruleset')
+    store_path = ('policy_definitions', 'RuleSet')
+
+
+@register('policy_definition', 'rule-set security policy definition', PolicyDefRuleSet, min_version='20.4')
+class PolicyDefRuleSetIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/ruleset', None, None, None)
+    store_file = 'policy_definitions_ruleset.json'
+
+
+class AdvancedInspectionProfile(PolicyDef):
+    api_path = ApiPath('template/policy/definition/advancedinspectionprofile')
+    store_path = ('policy_definitions', 'AdvancedInspectionProfile')
+
+
+@register('parent_policy_definition', 'advanced inspection profile policy definition', AdvancedInspectionProfile,
+          min_version='20.6')
+class AdvancedInspectionProfileIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/advancedinspectionprofile', None, None, None)
+    store_file = 'policy_definitions_advancedinspectionprofile.json'
+
+
+# VPN QoS MAP is registered as a parent_policy_definition because it references other policy definitions (e.g. QoSMAP)
+class VpnQosMap(PolicyDef):
+    api_path = ApiPath('template/policy/definition/vpnqosmap')
+    store_path = ('policy_definitions', 'VpnQosMap')
+
+
+@register('parent_policy_definition', 'vpn qos map policy definition', VpnQosMap, min_version='20.6')
+class VpnQosMapIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/vpnqosmap', None, None, None)
+    store_file = 'policy_definitions_vpnqosmap.json'
+
+
+class SecurityGroup(PolicyDef):
+    api_path = ApiPath('template/policy/definition/securitygroup')
+    store_path = ('policy_definitions', 'SecurityGroup')
+
+
+@register('policy_definition', 'security group policy definition', SecurityGroup, min_version='20.6')
+class SecurityGroupIndex(PolicyDefIndex):
+    api_path = ApiPath('template/policy/definition/securitygroup', None, None, None)
+    store_file = 'policy_definitions_securitygroup.json'
+
+
+#
+# Policy lists
+#
+
+# Policy list base class
+class PolicyList(ConfigItem):
+    id_tag = 'listId'
+    name_tag = 'name'
+    type_tag = 'type'
+    skip_cmp_tag_set = {'lastUpdated', 'referenceCount', 'references', 'activatedId', 'isActivatedByVsmart',
+                        'owner', 'infoTag'}
+
+
+# Policy list index base class
+class PolicyListIndex(IndexConfigItem):
+    iter_fields = IdName('listId', 'name')
+
+
+class PolicyListVpn(PolicyList):
+    api_path = ApiPath('template/policy/list/vpn')
+    store_path = ('policy_lists', 'VPN')
+
+
+@register('policy_list', 'VPN list', PolicyListVpn)
+class PolicyListVpnIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/vpn', None, None, None)
+    store_file = 'policy_lists_vpn.json'
+
+
+class PolicyListUrlWhiteList(PolicyList):
+    api_path = ApiPath('template/policy/list/urlwhitelist')
+    store_path = ('policy_lists', 'URLWhitelist')
+
+
+@register('policy_list', 'URL-whitelist list', PolicyListUrlWhiteList)
+class PolicyListUrlWhileListIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/urlwhitelist', None, None, None)
+    store_file = 'policy_lists_urlwhitelist.json'
+
+
+class PolicyListUrlBlackList(PolicyList):
+    api_path = ApiPath('template/policy/list/urlblacklist')
+    store_path = ('policy_lists', 'URLBlacklist')
+
+
+@register('policy_list', 'URL-blacklist list', PolicyListUrlBlackList)
+class PolicyListUrlBlackListIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/urlblacklist', None, None, None)
+    store_file = 'policy_lists_urlblacklist.json'
+
+
+class PolicyListPolicer(PolicyList):
+    api_path = ApiPath('template/policy/list/policer')
+    store_path = ('policy_lists', 'Policer')
+
+
+@register('policy_list', 'policer list', PolicyListPolicer)
+class PolicyListPolicerIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/policer', None, None, None)
+    store_file = 'policy_lists_policer.json'
+
+
+class PolicyListIpsSignature(PolicyList):
+    api_path = ApiPath('template/policy/list/ipssignature')
+    store_path = ('policy_lists', 'IPSSignature')
+
+
+@register('policy_list', 'IPS-signature list', PolicyListIpsSignature)
+class PolicyListIpsSignatureIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/ipssignature', None, None, None)
+    store_file = 'policy_lists_ipssignature.json'
+
+
+class PolicyListClass(PolicyList):
+    api_path = ApiPath('template/policy/list/class')
+    store_path = ('policy_lists', 'Class')
+
+
+@register('policy_list', 'class list', PolicyListClass)
+class PolicyListClassIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/class', None, None, None)
+    store_file = 'policy_lists_class.json'
+
+
+class PolicyListUmbrellaData(PolicyList):
+    api_path = ApiPath('template/policy/list/umbrelladata')
+    store_path = ('policy_lists', 'UmbrellaData')
+
+
+@register('policy_list', 'umbrella-data list', PolicyListUmbrellaData)
+class PolicyListUmbrellaDataIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/umbrelladata', None, None, None)
+    store_file = 'policy_lists_umbrelladata.json'
+
+
+class PolicyListSite(PolicyList):
+    api_path = ApiPath('template/policy/list/site')
+    store_path = ('policy_lists', 'Site')
+
+
+@register('policy_list', 'site list', PolicyListSite)
+class PolicyListSiteIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/site', None, None, None)
+    store_file = 'policy_lists_site.json'
+
+
+class PolicyListExtcommunity(PolicyList):
+    api_path = ApiPath('template/policy/list/extcommunity')
+    store_path = ('policy_lists', 'ExtCommunity')
+
+
+@register('policy_list', 'extended-community list', PolicyListExtcommunity)
+class PolicyListExtcommunityIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/extcommunity', None, None, None)
+    store_file = 'policy_lists_extcommunity.json'
+
+
+# Data Prefix All (template/policy/list/dataprefixall) was purposely not included as it seems to collide with, meaning
+# error, Data Prefix (template/policy/list/dataprefix).
+# Data Prefix FQDN (template/policy/list/dataprefixfqdn) was also not included for the same reason.
+class PolicyListDataprefix(PolicyList):
+    api_path = ApiPath('template/policy/list/dataprefix')
+    store_path = ('policy_lists', 'DataPrefix')
+
+
+@register('policy_list', 'data-prefix list', PolicyListDataprefix)
+class PolicyListDataprefixIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/dataprefix', None, None, None)
+    store_file = 'policy_lists_dataprefix.json'
+
+
+class PolicyListDataipv6prefix(PolicyList):
+    api_path = ApiPath('template/policy/list/dataipv6prefix')
+    store_path = ('policy_lists', 'DataIPv6Prefix')
+
+
+@register('policy_list', 'data-ipv6-prefix list', PolicyListDataipv6prefix)
+class PolicyListDataipv6prefixIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/dataipv6prefix', None, None, None)
+    store_file = 'policy_lists_dataipv6prefix.json'
+
+
+class PolicyListMirror(PolicyList):
+    api_path = ApiPath('template/policy/list/mirror')
+    store_path = ('policy_lists', 'Mirror')
+
+
+@register('policy_list', 'mirror list', PolicyListMirror)
+class PolicyListMirrorIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/mirror', None, None, None)
+    store_file = 'policy_lists_mirror.json'
+
+
+class PolicyListApplication(PolicyList):
+    api_path = ApiPath('template/policy/list/app')
+    store_path = ('policy_lists', 'App')
+
+
+@register('policy_list', 'application list', PolicyListApplication)
+class PolicyListApplicationIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/app', None, None, None)
+    store_file = 'policy_lists_app.json'
+
+
+class PolicyListLocalApplication(PolicyList):
+    api_path = ApiPath('template/policy/list/localapp')
+    store_path = ('policy_lists', 'LocalApp')
+
+
+@register('policy_list', 'local-application list', PolicyListLocalApplication)
+class PolicyListLocalApplicationIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/localapp', None, None, None)
+    store_file = 'policy_lists_localapp.json'
+
+
+class PolicyListSla(PolicyList):
+    api_path = ApiPath('template/policy/list/sla')
+    store_path = ('policy_lists', 'SLA')
+
+
+@register('policy_list', 'SLA-class list', PolicyListSla)
+class PolicyListSlaIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/sla', None, None, None)
+    store_file = 'policy_lists_sla.json'
+
+
+class PolicyListColor(PolicyList):
+    api_path = ApiPath('template/policy/list/color')
+    store_path = ('policy_lists', 'Color')
+
+
+@register('policy_list', 'color list', PolicyListColor)
+class PolicyListColorIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/color', None, None, None)
+    store_file = 'policy_lists_color.json'
+
+
+class PolicyListZone(PolicyList):
+    api_path = ApiPath('template/policy/list/zone')
+    store_path = ('policy_lists', 'Zone')
+
+
+@register('policy_list', 'zone list', PolicyListZone)
+class PolicyListZoneIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/zone', None, None, None)
+    store_file = 'policy_lists_zone.json'
+
+
+class PolicyListAspath(PolicyList):
+    api_path = ApiPath('template/policy/list/aspath')
+    store_path = ('policy_lists', 'ASPath')
+
+
+@register('policy_list', 'as-path list', PolicyListAspath)
+class PolicyListAspathIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/aspath', None, None, None)
+    store_file = 'policy_lists_aspath.json'
+
+
+class PolicyListTloc(PolicyList):
+    api_path = ApiPath('template/policy/list/tloc')
+    store_path = ('policy_lists', 'TLOC')
+
+
+@register('policy_list', 'TLOC list', PolicyListTloc)
+class PolicyListTlocIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/tloc', None, None, None)
+    store_file = 'policy_lists_tloc.json'
+
+
+# IP Prefix All (template/policy/list/ipprefixall) was purposely not included as it seems to collide with, meaning
+# error, IP Prefix (template/policy/list/prefix).
+class PolicyListPrefix(PolicyList):
+    api_path = ApiPath('template/policy/list/prefix')
+    store_path = ('policy_lists', 'Prefix')
+
+
+@register('policy_list', 'prefix list', PolicyListPrefix)
+class PolicyListPrefixIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/prefix', None, None, None)
+    store_file = 'policy_lists_prefix.json'
+
+
+class PolicyListIpv6prefix(PolicyList):
+    api_path = ApiPath('template/policy/list/ipv6prefix')
+    store_path = ('policy_lists', 'IPv6Prefix')
+
+
+@register('policy_list', 'ipv6-prefix list', PolicyListIpv6prefix)
+class PolicyListIpv6prefixIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/ipv6prefix', None, None, None)
+    store_file = 'policy_lists_ipv6prefix.json'
+
+
+class PolicyListFQDN(PolicyList):
+    api_path = ApiPath('template/policy/list/fqdn')
+    store_path = ('policy_lists', 'FQDN')
+
+
+@register('policy_list', 'FQDN list', PolicyListFQDN, min_version='20.1')
+class PolicyListFQDNIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/fqdn', None, None, None)
+    store_file = 'policy_lists_fqdn.json'
+
+
+class PolicyListLocaldomain(PolicyList):
+    api_path = ApiPath('template/policy/list/localdomain')
+    store_path = ('policy_lists', 'LocalDomain')
+
+
+@register('policy_list', 'local-domain list', PolicyListLocaldomain)
+class PolicyListLocaldomainIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/localdomain', None, None, None)
+    store_file = 'policy_lists_localdomain.json'
+
+
+class PolicyListCommunity(PolicyList):
+    api_path = ApiPath('template/policy/list/community')
+    store_path = ('policy_lists', 'Community')
+
+
+@register('policy_list', 'community list', PolicyListCommunity)
+class PolicyListCommunityIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/community', None, None, None)
+    store_file = 'policy_lists_community.json'
+
+
+# Umbrella Secret endpoints were removed in 19.3. Will leave it for now.
+class PolicyListUmbrellaSecret(PolicyList):
+    api_path = ApiPath('template/policy/list/umbrellasecret')
+    store_path = ('policy_lists', 'UmbrellaSecret')
+
+
+@register('policy_list', 'umbrella secret list', PolicyListUmbrellaSecret)
+class PolicyListUmbrellaSecretIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/umbrellasecret', None, None, None)
+    store_file = 'policy_lists_umbrellasecret.json'
+
+
+class PolicyListTGApiKey(PolicyList):
+    api_path = ApiPath('template/policy/list/tgapikey')
+    store_path = ('policy_lists', 'TGApiKey')
+
+
+@register('policy_list', 'threat grid api key list', PolicyListTGApiKey)
+class PolicyListTGApiKeyIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/tgapikey', None, None, None)
+    store_file = 'policy_lists_tgapikey.json'
+
+
+class PolicyListTransRules(PolicyList):
+    api_path = ApiPath('template/policy/list/translationrules')
+    store_path = ('policy_lists', 'TranslationRules')
+
+
+@register('policy_list', 'translation rules list', PolicyListTransRules, min_version='20.1')
+class PolicyListTransRulesIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/translationrules', None, None, None)
+    store_file = 'policy_lists_translationrules.json'
+
+
+class PolicyListTransProfile(PolicyList):
+    api_path = ApiPath('template/policy/list/translationprofile')
+    store_path = ('policy_lists', 'TranslationProfile')
+
+
+@register('policy_list', 'translation profile', PolicyListTransProfile, min_version='20.1')
+class PolicyListTransProfileIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/translationprofile', None, None, None)
+    store_file = 'policy_lists_translationprofile.json'
+
+
+class PolicyListSupervisoryDisc(PolicyList):
+    api_path = ApiPath('template/policy/list/supervisorydisc')
+    store_path = ('policy_lists', 'SupervisoryDisconnect')
+
+
+@register('policy_list', 'supervisory disconnect list', PolicyListSupervisoryDisc, min_version='20.1')
+class PolicyListSupervisoryDiscIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/supervisorydisc', None, None, None)
+    store_file = 'policy_lists_supervisorydisconnect.json'
+
+
+class PolicyListMediaProfile(PolicyList):
+    api_path = ApiPath('template/policy/list/mediaprofile')
+    store_path = ('policy_lists', 'MediaProfile')
+
+
+@register('policy_list', 'media profile list', PolicyListMediaProfile, min_version='20.1')
+class PolicyListMediaProfileIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/mediaprofile', None, None, None)
+    store_file = 'policy_lists_mediaprofile.json'
+
+
+class PolicyListFaxProtocol(PolicyList):
+    api_path = ApiPath('template/policy/list/faxprotocol')
+    store_path = ('policy_lists', 'FaxProtocol')
+
+
+@register('policy_list', 'fax protocol list', PolicyListFaxProtocol, min_version='20.3')
+class PolicyListFaxProtocolIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/faxprotocol', None, None, None)
+    store_file = 'policy_lists_faxprotocol.json'
+
+
+class PolicyListModemPassthrough(PolicyList):
+    api_path = ApiPath('template/policy/list/modempassthrough')
+    store_path = ('policy_lists', 'ModemPassthrough')
+
+
+@register('policy_list', 'modem passthrough list', PolicyListModemPassthrough, min_version='20.3')
+class PolicyListModemPassthroughIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/modempassthrough', None, None, None)
+    store_file = 'policy_lists_modempassthrough.json'
+
+
+class PolicyListTrunkGroup(PolicyList):
+    api_path = ApiPath('template/policy/list/trunkgroup')
+    store_path = ('policy_lists', 'TrunkGroup')
+
+
+@register('policy_list', 'trunk group list', PolicyListTrunkGroup, min_version='20.3')
+class PolicyListTrunkGroupIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/trunkgroup', None, None, None)
+    store_file = 'policy_lists_trunkgroup.json'
+
+
+class PolicyAppProbe(PolicyList):
+    api_path = ApiPath('template/policy/list/appprobe')
+    store_path = ('policy_lists', 'AppProbe')
+
+
+@register('policy_list', 'app-probe class list', PolicyAppProbe, min_version='20.4')
+class PolicyAppProbeIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/appprobe', None, None, None)
+    store_file = 'policy_lists_appprobe.json'
+
+
+class PolicyListPort(PolicyList):
+    api_path = ApiPath('template/policy/list/port')
+    store_path = ('policy_lists', 'Port')
+
+
+@register('policy_list', 'port security list', PolicyListPort, min_version='20.4')
+class PolicyListPortIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/port', None, None, None)
+    store_file = 'policy_lists_port.json'
+
+
+class PolicyListProtocol(PolicyList):
+    api_path = ApiPath('template/policy/list/protocolname')
+    store_path = ('policy_lists', 'Protocol')
+
+
+@register('policy_list', 'protocol security list', PolicyListProtocol, min_version='20.4')
+class PolicyListProtocolIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/protocolname', None, None, None)
+    store_file = 'policy_lists_protocol.json'
+
+
+class PolicyListExpandedCommunity(PolicyList):
+    api_path = ApiPath('template/policy/list/expandedcommunity')
+    store_path = ('policy_lists', 'ExpandedCommunity')
+
+
+@register('policy_list', 'expanded community list', PolicyListExpandedCommunity, min_version='20.5')
+class PolicyListExpandedCommunityIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/expandedcommunity', None, None, None)
+    store_file = 'policy_lists_expanded_community.json'
+
+
+class PolicyListGeoLocation(PolicyList):
+    api_path = ApiPath('template/policy/list/geolocation')
+    store_path = ('policy_lists', 'GeoLocation')
+
+
+@register('policy_list', 'geo location list', PolicyListGeoLocation, min_version='20.5')
+class PolicyListGeoLocationIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/geolocation', None, None, None)
+    store_file = 'policy_lists_geo_location.json'
+
+
+class PolicyListRegion(PolicyList):
+    api_path = ApiPath('template/policy/list/region')
+    store_path = ('policy_lists', 'Region')
+
+
+@register('policy_list', 'region list', PolicyListRegion, min_version='20.7')
+class PolicyListRegionIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/region', None, None, None)
+    store_file = 'policy_lists_region.json'
+
+
+class PolicyListPreferredColorGroup(PolicyList):
+    api_path = ApiPath('template/policy/list/preferredcolorgroup')
+    store_path = ('policy_lists', 'PreferredColorGroup')
+
+
+@register('policy_list', 'preferred color group list', PolicyListPreferredColorGroup, min_version='20.9')
+class PolicyListPreferredColorGroupIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/preferredcolorgroup', None, None, None)
+    store_file = 'policy_lists_preferredcolorgroup.json'
+
+
+class PolicyListIdentity(PolicyList):
+    api_path = ApiPath('template/policy/list/identity')
+    store_path = ('policy_lists', 'Identity')
+
+
+@register('policy_list', 'identity list', PolicyListIdentity, min_version='20.10')
+class PolicyListIdentityIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/identity', None, None, None)
+    store_file = 'policy_lists_identity.json'
+
+
+class PolicyListScalableGroupTag(PolicyList):
+    api_path = ApiPath('template/policy/list/scalablegrouptag')
+    store_path = ('policy_lists', 'ScalableGroupTag')
+
+
+@register('policy_list', 'scalable group tag list', PolicyListScalableGroupTag, min_version='20.10')
+class PolicyListScalableGroupTagIndex(PolicyListIndex):
+    api_path = ApiPath('template/policy/list/scalablegrouptag', None, None, None)
+    store_file = 'policy_lists_scalable_group_tag.json'
+
+
+#
+# Admin Settings
+#
+class SettingsVbond(AdminSettingsItem):
+    """SD-WAN Validator settings (Administration > Settings)"""
+    setting = 'device'
+    store_file = 'vbond.json'
+
+    @property
+    def is_configured(self) -> bool:
+        domain_ip = self.data.get('domainIp', '')
+        return len(domain_ip) > 0 and domain_ip != 'Not Configured'
+
+    @property
+    def domain_ip(self) -> str | None:
+        return self.data['domainIp'] if self.is_configured else None
+
+    @property
+    def port(self) -> str | None:
+        return self.data['port'] if self.is_configured else None
+
+
+class SettingsOrganization(AdminSettingsItem):
+    setting = 'organization'
+    store_file = 'organization.json'
+
+    @property
+    def organization(self) -> str | None:
+        return self.data.get('org')
+
+    @property
+    def is_control_up(self) -> bool:
+        return self.data.get('controlConnectionUp', False)
+
+
+class SettingsCertificate(AdminSettingsItem):
+    setting = 'certificate'
+    store_file = 'certificate.json'
+
+    @property
+    def signing(self) -> str | None:
+        return self.data.get('certificateSigning')
+
+    @classmethod
+    def set_signing_enterprise(cls, api: Rest, root_ca_certificate: str) -> None:
+        api_path = cls.api_path.resolve(setting=cls.setting).post
+
+        enterprise_reply = api.post({"certificateSigning": "enterprise"}, api_path)
+        if enterprise_reply.get("data", [{}, ])[0].get("certificateSigning") != "enterprise":
+            raise RestAPIException("Unable to set enterprise certificate signing")
+
+        root_ca_reply = api.put({"enterpriseRootCA": root_ca_certificate}, api_path, "enterpriserootca")
+        if root_ca_reply.get("data", [{}, ])[0].get("enterpriseRootCA") != root_ca_certificate:
+            raise RestAPIException("Unable to set enterprise root CA certificate")
+
+
+#
+# Edge Certificate
+#
+class EdgeCertificate(IndexConfigItem):
+    api_path = ApiPath('certificate/vedge/list', 'certificate/save/vedge/list', None, None)
+    store_path = ('certificates',)
+    store_file = 'edge_certificates.json'
+    iter_fields = ('uuid', 'validity')
+
+    extended_iter_fields = ('host-name', 'chasisNumber', 'serialNumber', 'vedgeCertificateState')
+
+    _state_lookup = {
+        'tokengenerated': 'token generated',
+        'bootstrapconfiggenerated': 'bootstrap config generated',
+        'csrgenerated': 'CSR generated',
+        'csrfailed': 'CSR failed',
+        'certinstallfailed': 'certificate install failed',
+        'certinstalled': 'certificate installed',
+    }
+
+    @classmethod
+    def state_str(cls, state):
+        """
+        Convert the state field from WAN edge certificate into user-friendly string. If not known, return the original
+        state field
+        @param state: string containing the WAN edge certificate state field.
+        @return: string
+        """
+        return cls._state_lookup.get(state, state)
+
+    def status_post_data(self, *new_status):
+        """
+        Build payload to be used for POST requests that update WAN edge certificate validity status
+        @param new_status: One or more (<uuid>, <new status>) tuples
+        @return: List containing payload for POST requests
+        """
+        new_status_dict = dict(new_status)
+
+        return [
+            {
+                'chasisNumber': chassis,
+                'serialNumber': serial,
+                'validity': new_status_dict[uuid]
+            }
+            for uuid, status, hostname, chassis, serial, state in self.extended_iter() if uuid in new_status_dict
+        ]
+
+
+#
+# Conversion functions
+#
+def datetime_format(timestamp: str | None, epoch_value_return: str = '') -> str:
+    if timestamp is None:
+        return ''
+
+    if timestamp == 0:
+        return epoch_value_return
+
+    return entry_time_parse(timestamp).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def string_strip(value: str | None) -> str:
+    if value is None:
+        return ''
+
+    return value.strip()
+
+
+#
+# Log items
+#
+class Alarm(RecordItem):
+    api_path = ApiPath(None, 'alarms', None, None)
+    fields_std = ('entry_time', 'severity', 'message')
+    fields_ext = ('cleared_time', )
+    field_conversion_fns = {
+        'entry_time': datetime_format,
+        'cleared_time': datetime_format
+    }
+
+
+class Event(RecordItem):
+    api_path = ApiPath(None, 'event', None, None)
+    fields_std = ('entry_time', 'host_name', 'severity_level', 'eventname')
+    fields_ext = ('details',)
+    field_conversion_fns = {
+        'entry_time': datetime_format
+    }
+
+
+#
+# Realtime items
+#
+@op_register('system', 'status', 'System status')
+class SystemStatus(RealtimeItem):
+    api_path = ApiPath('device/system/status', None, None, None)
+    fields_std = ('state', 'cpu_user', 'cpu_system', 'mem_total', 'mem_free')
+    fields_ext = ('disk_size', 'disk_used')
+
+
+@op_register('system', 'statistics', 'System statistics')
+class SystemStats(RealtimeItem):
+    api_path = ApiPath('device/system/statistics', None, None, None)
+    fields_std = ('rx_pkts', 'tx_pkts', 'rx_drops', 'fragment_df_drops')
+    fields_ext = ('ip_fwd_to_cpu', 'to_cpu_policer_drops')
+
+
+@op_register('bfd', 'sessions', 'BFD sessions')
+class BfdSessions(RealtimeItem):
+    api_path = ApiPath('device/bfd/sessions', None, None, None)
+    fields_std = ('system_ip', 'site_id', 'local_color', 'color', 'state')
+    fields_ext = ('src_ip', 'src_port', 'dst_ip', 'dst_port')
+
+
+@op_register('bfd', 'summary', 'BFD summary')
+class BfdSummary(RealtimeItem):
+    api_path = ApiPath('device/bfd/summary', None, None, None)
+    fields_std = ('vdevice_name', 'bfd_sessions_total', 'bfd_sessions_up', 'bfd_sessions_max', 'bfd_sessions_flap')
+    fields_ext = ('poll_interval', 'lastupdated')
+    field_conversion_fns = {
+        'lastupdated': datetime_format
+    }
+
+
+@op_register('control', 'connections', 'Control connections')
+class DeviceControlConnections(RealtimeItem):
+    api_path = ApiPath('device/control/connections', None, None, None)
+    fields_std = ('vdevice_name', 'system_ip', 'site_id', 'peer_type', 'local_color', 'remote_color', 'state')
+    fields_ext = ('private_ip', 'private_port', 'public_ip', 'public_port', 'instance', 'protocol', 'domain_id')
+    fields_sub = ('local_color', 'remote_color')
+
+
+@op_register('control', 'wan-interfaces', 'Control WAN interfaces')
+class DeviceControlWAN(RealtimeItem):
+    api_path = ApiPath('device/control/waninterface', None, None, None)
+    fields_std = ('vdevice_name', 'interface', 'color', 'private_ip', 'public_ip', 'admin_state', 'operation_state',
+                  'carrier')
+    fields_ext = ('private_port', 'public_port')
+
+
+@op_register('control', 'local-properties', 'Control local-properties')
+class DeviceControlLocalProperties(RealtimeItem):
+    api_path = ApiPath('device/control/localproperties', None, None, None)
+    fields_std = ('system_ip', 'site_id', 'device_type', 'organization_name', 'domain_id', 'port_hopped')
+    fields_ext = ('protocol', 'tls_port', 'certificate_status', 'root_ca_chain_status', 'certificate_validity',
+                  'certificate_not_valid_after')
+
+
+@op_register('orchestrator', 'connections', 'Orchestrator connections')
+class OrchestratorConnections(RealtimeItem):
+    api_path = ApiPath('device/orchestrator/connections', None, None, None)
+    fields_std = ('system_ip', 'site_id', 'peer_type', 'local_color', 'state')
+    fields_ext = ('private_ip', 'private_port', 'public_ip', 'public_port', 'domain_id')
+
+
+@op_register('orchestrator', 'local-properties', 'Orchestrator local-properties')
+class OrchestratorLocalProperties(RealtimeItem):
+    api_path = ApiPath('device/orchestrator/localproperties', None, None, None)
+    fields_std = ('system_ip', 'device_type', 'organization_name', 'uuid', 'board_serial')
+    fields_ext = ('protocol', 'certificate_status', 'root_ca_chain_status', 'certificate_validity',
+                  'certificate_not_valid_after')
+
+
+@op_register('orchestrator', 'valid-vedges', 'Orchestrator valid WAN edges')
+class OrchestratorValidEdges(RealtimeItem):
+    api_path = ApiPath('device/orchestrator/validvedges', None, None, None)
+    fields_std = ('chassis_number', 'serial_number', 'validity')
+
+
+@op_register('orchestrator', 'valid-vsmarts', 'Orchestrator valid vSmarts')
+class OrchestratorValidVsmarts(RealtimeItem):
+    api_path = ApiPath('device/orchestrator/validvsmarts', None, None, None)
+    fields_std = ('serial_number',)
+
+
+@op_register('interface', 'vedge', 'vEdge interface information')
+class InterfaceVedge(RealtimeItem):
+    api_path = ApiPath('device/interface', None, None, None)
+    fields_std = ('vpn_id', 'ifname', 'af_type', 'ip_address', 'ipv6_address', 'if_admin_status', 'if_oper_status',
+                  'desc')
+    fields_ext = ('tx_drops', 'rx_drops', 'tx_kbps', 'rx_kbps')
+    fields_sub = ('ifname',)
+
+    @classmethod
+    def is_in_scope(cls, device_model: str) -> bool:
+        return device_model not in CEDGE_SET
+
+
+@op_register('interface', 'cedge', 'cEdge interface information')
+class InterfaceCedge(RealtimeItem):
+    api_path = ApiPath('device/interface', None, None, None)
+    fields_std = ('vpn_id', 'ifname', 'ip_address', 'if_admin_status', 'if_oper_status')
+    fields_ext = ('tx_drops', 'rx_drops', 'tx_kbps', 'rx_kbps')
+    fields_sub = ('ifname',)
+
+    @classmethod
+    def is_in_scope(cls, device_model: str) -> bool:
+        return device_model in CEDGE_SET
+
+
+@op_register('app-route', 'stats', 'Application-aware route statistics')
+class AppRouteStats(RealtimeItem):
+    api_path = ApiPath('device/app-route/statistics', None, None, None)
+    fields_std = ('index', 'remote_system_ip', 'local_color', 'remote_color', 'total_packets', 'loss',
+                  'average_latency', 'average_jitter')
+    fields_ext = ('mean_loss', 'mean_latency', 'mean_jitter', 'sla_class_index')
+
+
+@op_register('app-route', 'sla-class', 'Application-aware SLA class')
+class AppRouteSlaClass(RealtimeItem):
+    api_path = ApiPath('device/app-route/sla-class', None, None, None)
+    fields_std = ('name', 'loss', 'latency', 'jitter')
+    fields_ext = ('index',)
+
+
+@op_register('omp', 'summary', 'OMP summary')
+class DeviceOmpSummary(RealtimeItem):
+    api_path = ApiPath('device/omp/summary', None, None, None)
+    fields_std = ('operstate', 'ompuptime', 'vsmart_peers', 'routes_received', 'routes_installed', 'routes_sent',
+                  'tlocs_received', 'tlocs_installed', 'tlocs_sent')
+    fields_ext = ('services_received', 'services_installed', 'services_sent', 'policy_received', 'policy_sent')
+
+
+@op_register('omp', 'peers', 'OMP peers')
+class DeviceOmpPeers(RealtimeItem):
+    api_path = ApiPath('device/omp/peers', None, None, None)
+    fields_std = ('peer', 'type', 'site_id', 'state')
+    fields_ext = ('domain_id', 'up_time')
+
+
+@op_register('omp', 'adv-routes', 'OMP advertised routes')
+class DeviceOmpRoutesAdv(RealtimeItem):
+    api_path = ApiPath('device/omp/routes/advertised', None, None, None)
+    fields_std = ('vpn_id', 'prefix', 'to_peer', 'color', 'ip', 'protocol', 'metric', 'preference')
+    fields_ext = ('tag', 'originator', 'site_id')
+
+
+@op_register('tunnel', 'stats', 'Tunnel statistics')
+class DeviceTunnelStats(RealtimeItem):
+    api_path = ApiPath('device/tunnel/statistics', None, None, None)
+    fields_std = ('system_ip', 'local_color', 'remote_color', 'tunnel_protocol', 'tunnel_mtu', 'tcp_mss_adjust')
+    fields_ext = ('source_ip', 'dest_ip', 'source_port', 'dest_port')
+
+
+@op_register('software', 'info', 'Software info')
+class DeviceSoftware(RealtimeItem):
+    api_path = ApiPath('device/software', None, None, None)
+    fields_std = ('version', 'active', 'default')
+
+
+@op_register('dpi', 'summary', 'DPI summary')
+class DeviceDpiSummary(RealtimeItem):
+    api_path = ApiPath('device/dpi/summary', None, None, None)
+    fields_std = ('status', 'current_flows', 'peak_flows', 'current_rate', 'peak_rate')
+    fields_ext = ('flows_created', 'flows_expired')
+
+
+@op_register('arp', 'vedge', 'vEdge ARP table')
+class ArpVedge(RealtimeItem):
+    api_path = ApiPath('device/arp', None, None, None)
+    fields_std = ('vpn_id', 'if_name', 'ip', 'mac', 'state')
+
+    @classmethod
+    def is_in_scope(cls, device_model: str) -> bool:
+        return device_model not in CEDGE_SET
+
+
+@op_register('arp', 'cedge', 'cEdge ARP table')
+class ArpCedge(RealtimeItem):
+    api_path = ApiPath('device/arp', None, None, None)
+    fields_std = ('vpn_id', 'interface', 'address', 'hardware', 'mode')
+
+    @classmethod
+    def is_in_scope(cls, device_model: str) -> bool:
+        return device_model in CEDGE_SET
+
+
+@op_register('hardware', 'inventory', 'hardware inventory')
+class HardwareInventory(RealtimeItem):
+    api_path = ApiPath('device/hardware/inventory', None, None, None)
+    fields_std = ('hw_type', 'hw_description')
+    fields_ext = ('version', 'part_number', 'serial_number')
+
+    field_conversion_fns = {
+        'hw_description': string_strip,
+        'version': string_strip,
+        'part_number': string_strip
+    }
+
+
+@op_register('hardware', 'environment', 'hardware environment')
+class HardwareEnvironment(RealtimeItem):
+    api_path = ApiPath('device/hardware/environment', None, None, None)
+    fields_std = ('name', 'sensor_name', 'state')
+    fields_ext = ('current_reading', 'sensor_units')
+
+    @classmethod
+    def is_in_scope(cls, device_model: str) -> bool:
+        return device_model not in SOFT_EDGE_SET
+
+
+#
+# Bulk Statistics Items
+#
+@op_register('app-route', 'stats', 'Application-aware route statistics')
+class BulkAppRoute(BulkStatsItem):
+    api_path = ApiPath('data/device/statistics/approutestatsstatistics', None, None, None)
+    fields_std = ('local_system_ip', 'remote_system_ip', 'local_color', 'remote_color', 'total', 'loss', 'latency',
+                  'jitter', 'name')
+    fields_ext = ('tx_pkts', 'rx_pkts', 'tx_octets', 'rx_octets')
+    fields_to_avg = ('total', 'loss', 'latency', 'jitter')
+
+    @staticmethod
+    def time_series_key(sample: tuple[Any, ...]) -> str:
+        return sample.name
+
+
+@op_register('interface', 'info', 'Interface info')
+class BulkInterfaceStats(BulkStatsItem):
+    api_path = ApiPath('data/device/statistics/interfacestatistics', None, None, None)
+    fields_std = ('vpn_id', 'interface', 'tx_kbps', 'rx_kbps', 'tx_pps', 'rx_pps')
+    fields_ext = ('rx_pkts', 'tx_pkts', 'rx_drops', 'tx_drops', 'rx_errors', 'tx_errors')
+    fields_to_avg = ('tx_kbps', 'rx_kbps', 'tx_pps', 'rx_pps')
+
+    @staticmethod
+    def time_series_key(sample: tuple[Any, ...]) -> str:
+        return f"{sample.vdevice_name}_{sample.vpn_id}_{sample.interface}"
+
+
+@op_register('system', 'status', 'System status')
+class BulkSystemStats(BulkStatsItem):
+    api_path = ApiPath('data/device/statistics/devicesystemstatusstatistics', None, None, None)
+    fields_std = ('cpu_user_new', 'mem_util')
+    fields_ext = ('mem_used', 'mem_free', 'disk_used', 'disk_avail')
+    fields_to_avg = ('cpu_user_new', 'mem_util', 'mem_used', 'mem_free', 'disk_used', 'disk_avail')
+    field_conversion_fns = {
+        'mem_util': lambda x: 100 * x
+    }
+
+
+#
+# Bulk State Items
+#
+@op_register('system', 'info', 'System info')
+class BulkSystemStatus(BulkStateItem):
+    api_path = ApiPath('data/device/state/SystemStatus', None, None, None)
+    fields_std = ('state', 'total_cpu_count', 'fp_cpu_count', 'linux_cpu_count', 'tcpd_cpu_count')
+    fields_ext = ('reboot_reason', 'reboot_type')
+
+
+@op_register('bfd', 'sessions', 'BFD sessions')
+class BulkBfdSessions(BulkStateItem):
+    api_path = ApiPath('data/device/state/BFDSessions', None, None, None)
+    fields_std = ('system_ip', 'site_id', 'local_color', 'color', 'state')
+    fields_ext = ('src_ip', 'src_port', 'dst_ip', 'dst_port', 'transitions', 'uptime_date')
+
+    field_conversion_fns = {
+        'uptime_date': datetime_format
+    }
+
+
+@op_register('control', 'connections', 'Control connections')
+class BulkControlConnections(BulkStateItem):
+    api_path = ApiPath('data/device/state/ControlConnection', None, None, None)
+    fields_std = ('system_ip', 'site_id', 'peer_type', 'local_color', 'remote_color', 'state')
+    fields_ext = ('private_ip', 'private_port', 'public_ip', 'public_port', 'instance', 'protocol', 'domain_id',
+                  'uptime_date')
+    fields_sub = ('local_color', 'remote_color')
+
+    field_conversion_fns = {
+        'uptime_date': datetime_format
+    }
+
+
+@op_register('control', 'local-properties', 'Control local-properties')
+class BulkControlLocalProperties(BulkStateItem):
+    api_path = ApiPath('data/device/state/ControlLocalProperty', None, None, None)
+    fields_std = ('system_ip', 'site_id', 'device_type', 'organization_name', 'domain_id', 'port_hopped')
+    fields_ext = ('protocol', 'tls_port', 'certificate_status', 'root_ca_chain_status', 'certificate_validity',
+                  'certificate_not_valid_after')
+
+
+@op_register('interface', 'vedge', 'vEdge interfaces')
+class BulkInterfaceVedge(BulkStateItem):
+    api_path = ApiPath('data/device/state/Interface', None, None, None)
+    fields_std = ('vpn_id', 'ifname', 'af_type', 'ip_address', 'ipv6_address', 'if_admin_status',
+                  'if_oper_status', 'desc')
+    fields_ext = ('mtu', 'hwaddr', 'speed_mbps', 'port_type')
+    fields_sub = ('ifname',)
+
+
+@op_register('interface', 'cedge', 'cEdge interfaces')
+class BulkInterfaceCedge(BulkStateItem):
+    api_path = ApiPath('data/device/state/CEdgeInterface', None, None, None)
+    fields_std = ('vpn_id', 'ifname', 'ip_address', 'ipv4_subnet_mask', 'ipv6_addrs', 'if_admin_status',
+                  'if_oper_status', 'description')
+    fields_ext = ('mtu', 'hwaddr', 'speed_mbps')
+    fields_sub = ('ifname',)
+
+
+@op_register('omp', 'peers', 'OMP peers')
+class BulkOmpPeers(BulkStateItem):
+    api_path = ApiPath('data/device/state/OMPPeer', None, None, None)
+    fields_std = ('peer', 'type', 'site_id', 'state')
+    fields_ext = ('domain_id',)
