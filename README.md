@@ -110,7 +110,10 @@ The combined archive path is printed on completion.
 
 ## Licensing
 
-This project is released under the [MIT License](LICENSE).
+This project is released under the
+[Cisco Sample Code License, Version 1.1](LICENSE). The Sample Code is provided
+by Cisco "as is", is not supported by Cisco TAC, and is intended for example
+purposes only.
 
 It bundles a third-party SD-WAN configuration backup engine under
 `tools/cisco_sdwan/`, © Cisco Systems, Inc., distributed under the MIT License
